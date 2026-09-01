@@ -14,7 +14,7 @@ data class AppUpdateInfo(
     val notes: String
 )
 
-private const val UPDATE_REPOSITORY_OWNER = "YOUR_GITHUB_USERNAME"
+private const val UPDATE_REPOSITORY_OWNER = "superZZZ101"
 private const val UPDATE_REPOSITORY_NAME = "jingdu-reader-android"
 private const val UPDATE_ASSET_NAME = "jingdu-reader.apk"
 

@@ -28,7 +28,7 @@
 
 ## GitHub 发布与更新
 
-应用通过 `app/src/main/java/com/example/jingdu/UpdateChecker.kt` 检查公开仓库 `jingdu-reader-android` 的最新 Release。创建仓库后，将文件中的 `YOUR_GITHUB_USERNAME` 替换为实际 GitHub 用户名。
+应用通过 `app/src/main/java/com/example/jingdu/UpdateChecker.kt` 检查公开仓库 `https://github.com/superZZZ101/jingdu-reader-android` 的最新 Release。
 
 发布版本时递增 `app/build.gradle.kts` 中的 `versionCode` 和 `versionName`，然后创建形如 `v1.4.0` 的 Git 标签并推送。`.github/workflows/release.yml` 会构建签名 APK 并发布到 GitHub Release，应用下次启动时会检测到它。签名密钥只通过 GitHub Actions Secrets 提供，不要提交 `keystore.properties` 或 `.jks` 文件。
 
