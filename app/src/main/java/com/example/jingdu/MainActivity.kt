@@ -1669,6 +1669,7 @@ private fun ChapterView(
             settings = settings,
             readingOffset = readingOffset,
             chapterOpenPosition = chapterOpenPosition,
+            nextChapter = nextChapter,
             nextChapterReady = nextChapterReady,
             onPositionChange = onPositionChange,
             onNavigateChapter = onNavigateChapter,
@@ -1890,6 +1891,7 @@ private fun HorizontalChapterView(
     settings: ReaderSettings,
     readingOffset: Int?,
     chapterOpenPosition: ChapterOpenPosition?,
+    nextChapter: ReaderDocument?,
     nextChapterReady: Boolean,
     onPositionChange: (Int) -> Unit,
     onNavigateChapter: (String, ChapterOpenPosition) -> Unit,
@@ -1913,8 +1915,20 @@ private fun HorizontalChapterView(
             paginateChapterPages(document, textMeasurer, density, contentWidthPx, contentHeightPx, settings)
         }
         val hasNextChapter = document.navigation.next != null
-        val showNextSentinel = hasNextChapter && nextChapterReady
-        val totalPages = pages.size + if (showNextSentinel) 1 else 0
+        val nextPages = remember(
+            nextChapter?.sourceUrl,
+            settings.fontSize,
+            settings.lineHeight,
+            contentWidthPx,
+            contentHeightPx
+        ) {
+            nextChapter
+                ?.takeIf { nextChapterReady && !it.isCatalog && it.paragraphs.isNotEmpty() }
+                ?.let { paginateChapterPages(it, textMeasurer, density, contentWidthPx, contentHeightPx, settings) }
+                .orEmpty()
+        }
+        val showNextContent = hasNextChapter && nextPages.isNotEmpty()
+        val totalPages = pages.size + if (showNextContent) nextPages.size else 0
         val pagerState = key(document.sourceUrl) {
             rememberPagerState(pageCount = { totalPages })
         }
@@ -1956,8 +1970,8 @@ private fun HorizontalChapterView(
                     onPositionChange(textOffset)
                 }
         }
-        LaunchedEffect(document.sourceUrl, pagerState.currentPage, pages.size, showNextSentinel) {
-            if (showNextSentinel && pagerState.currentPage == pages.size) onAutoNext()
+        LaunchedEffect(document.sourceUrl, pagerState.currentPage, pages.size, nextPages.size, showNextContent) {
+            if (showNextContent && pagerState.currentPage >= pages.size) onAutoNext()
         }
 
         Box(modifier = Modifier.fillMaxSize()) {
@@ -1992,15 +2006,22 @@ private fun HorizontalChapterView(
                                 swipedRight && pageAtDown == 0 -> {
                                     document.navigation.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.END) }
                                 }
-                                !swipedRight && pageAtDown == pages.lastIndex && !showNextSentinel -> {
+                                !swipedRight && pageAtDown == pages.lastIndex && !showNextContent -> {
                                     document.navigation.next?.let { onNavigateChapter(it.href, ChapterOpenPosition.START) }
                                 }
                             }
                         }
                     )
             ) { page ->
-                if (page == pages.size && showNextSentinel) {
-                    AutoNextView(palette)
+                if (showNextContent && page >= pages.size) {
+                    val nextPage = page - pages.size
+                    HorizontalChapterPage(
+                        document = nextChapter!!,
+                        text = nextPages[nextPage].text,
+                        page = nextPage,
+                        palette = palette,
+                        settings = settings
+                    )
                 } else {
                     HorizontalChapterPage(
                         document = document,
