@@ -24,7 +24,7 @@ val hasReleaseSigning = listOf(
 
 android {
     namespace = "com.example.jingdu"
-    compileSdk = 37
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.example.jingdu"
