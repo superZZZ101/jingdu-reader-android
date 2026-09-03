@@ -13,7 +13,9 @@ data class ReaderLink(
 data class ReaderNavigation(
     val previous: ReaderLink?,
     val next: ReaderLink?,
-    val catalog: ReaderLink?
+    val catalog: ReaderLink?,
+    val previousPage: ReaderLink? = null,
+    val nextPage: ReaderLink? = null
 )
 
 data class ReaderDocument(
@@ -41,16 +43,22 @@ fun parseReaderPayload(raw: String): ReaderDocument? {
     }.getOrNull() ?: return null
     val json = runCatching { JSONObject(payload) }.getOrNull() ?: return null
     val navigation = json.optJSONObject("navigation")
+    val paragraphs = json.optStringList("paragraphs").filterNot(::isReaderNoiseParagraph)
+    val catalogItems = json.optLinkList("catalogItems")
+    val catalogPages = json.optLinkList("catalogPages")
+    val rawTitle = json.optString("title", "未识别标题")
     return ReaderDocument(
         sourceUrl = json.optString("sourceUrl"),
-        title = json.optString("title", "未识别标题"),
-        paragraphs = json.optStringList("paragraphs"),
-        catalogItems = json.optLinkList("catalogItems"),
-        catalogPages = json.optLinkList("catalogPages"),
+        title = if (catalogItems.isEmpty()) cleanChapterTitle(rawTitle) else rawTitle,
+        paragraphs = paragraphs,
+        catalogItems = catalogItems,
+        catalogPages = catalogPages,
         navigation = ReaderNavigation(
             previous = navigation?.optLink("previous"),
             next = navigation?.optLink("next"),
-            catalog = navigation?.optLink("catalog")
+            catalog = navigation?.optLink("catalog"),
+            previousPage = navigation?.optLink("previousPage"),
+            nextPage = navigation?.optLink("nextPage")
         )
     )
 }
@@ -82,6 +90,30 @@ private fun JSONObject.toReaderLink(): ReaderLink? {
     return if (label.isNotEmpty() && href.isNotEmpty()) ReaderLink(label, href) else null
 }
 
+fun cleanChapterTitle(raw: String): String {
+    var title = raw.trim()
+        .replace(Regex("\\s*[（(]\\s*\\d+\\s*/\\s*\\d+\\s*[）)]\\s*$"), "")
+        .trim()
+    val underscore = title.indexOf('_')
+    if (underscore > 0) {
+        val suffix = title.substring(underscore + 1)
+        if (suffix.contains(Regex("小说|阅读|免费|网站|网"))) title = title.substring(0, underscore).trim()
+    }
+    title = title.replace(Regex("\\s*[-|｜·•]\\s*[^-|｜·•]*(?:小说|阅读|免费|网站|网).*$", RegexOption.IGNORE_CASE), "")
+    return title.trim().ifEmpty { raw.trim().ifEmpty { "未识别标题" } }
+}
+
+private fun isReaderNoiseParagraph(raw: String): Boolean {
+    val text = raw.trim()
+    val normalized = text.replace("/", "").replace("\\", "")
+    return normalized.matches(
+        Regex("^(上一章|下一章|上一页|下一页|上页|下页|前页|后页|书页/?目录|目录|章节目录|加入书签|收藏本书|投推荐票|章节报错).{0,280}$")
+    ) || (normalized.startsWith("上一章") || normalized.startsWith("下一章")) && normalized.length < 280 ||
+        normalized.contains("阅读体验极差") ||
+        normalized.startsWith("如果被") && normalized.contains("阅读模式") ||
+        normalized.matches(Regex("^(网页无法打开|无法加载此网页|无法连接到该网站|This site can.?t be reached|ERR_[A-Z_]+).*$", RegexOption.IGNORE_CASE))
+}
+
 data class ShelfBook(
     val key: String,
     val title: String,
@@ -92,6 +124,71 @@ data class ShelfBook(
 )
 
 private const val SHELF_BOOKS_KEY = "shelf_books"
+private const val READER_DOCUMENT_CACHE_KEY = "reader_current_document_cache"
+
+private fun ReaderLink.toJson(): JSONObject = JSONObject().apply {
+    put("label", label)
+    put("href", href)
+}
+
+private fun JSONObject.putLink(name: String, link: ReaderLink?) {
+    put(name, link?.toJson() ?: JSONObject.NULL)
+}
+
+private fun ReaderDocument.toCacheJson(): JSONObject = JSONObject().apply {
+    put("sourceUrl", sourceUrl)
+    put("title", title)
+    put("paragraphs", JSONArray().also { values -> paragraphs.forEach(values::put) })
+    put("catalogItems", JSONArray().also { values -> catalogItems.forEach { values.put(it.toJson()) } })
+    put("catalogPages", JSONArray().also { values -> catalogPages.forEach { values.put(it.toJson()) } })
+    put("navigation", JSONObject().apply {
+        putLink("previous", navigation.previous)
+        putLink("next", navigation.next)
+        putLink("catalog", navigation.catalog)
+        putLink("previousPage", navigation.previousPage)
+        putLink("nextPage", navigation.nextPage)
+    })
+}
+
+private fun JSONObject.toCachedReaderDocument(): ReaderDocument? {
+    val sourceUrl = optString("sourceUrl").trim()
+    if (sourceUrl.isEmpty()) return null
+    val navigation = optJSONObject("navigation")
+    val paragraphs = optStringList("paragraphs").filterNot(::isReaderNoiseParagraph)
+    val catalogItems = optLinkList("catalogItems")
+    val catalogPages = optLinkList("catalogPages")
+    val rawTitle = optString("title", "未识别标题")
+    return ReaderDocument(
+        sourceUrl = sourceUrl,
+        title = if (catalogItems.isEmpty()) cleanChapterTitle(rawTitle) else rawTitle,
+        paragraphs = paragraphs,
+        catalogItems = catalogItems,
+        catalogPages = catalogPages,
+        navigation = ReaderNavigation(
+            previous = navigation?.optLink("previous"),
+            next = navigation?.optLink("next"),
+            catalog = navigation?.optLink("catalog"),
+            previousPage = navigation?.optLink("previousPage"),
+            nextPage = navigation?.optLink("nextPage")
+        )
+    )
+}
+
+fun loadCachedReaderDocument(preferences: SharedPreferences): ReaderDocument? {
+    val raw = preferences.getString(READER_DOCUMENT_CACHE_KEY, null).orEmpty()
+    if (raw.isBlank()) return null
+    return runCatching { JSONObject(raw).toCachedReaderDocument() }.getOrNull()
+}
+
+fun saveCachedReaderDocument(
+    preferences: SharedPreferences,
+    document: ReaderDocument,
+    commit: Boolean = false
+) {
+    if (document.sourceUrl.isBlank() || document.isCatalog || document.paragraphs.isEmpty()) return
+    val editor = preferences.edit().putString(READER_DOCUMENT_CACHE_KEY, document.toCacheJson().toString())
+    if (commit) editor.commit() else editor.apply()
+}
 
 fun loadShelfBooks(preferences: SharedPreferences): List<ShelfBook> {
     val raw = preferences.getString(SHELF_BOOKS_KEY, null).orEmpty()
@@ -110,7 +207,7 @@ fun loadShelfBooks(preferences: SharedPreferences): List<ShelfBook> {
                         title = item.optString("title", "未命名书籍").trim().ifEmpty { "未命名书籍" },
                         catalogUrl = item.optString("catalogUrl").trim(),
                         lastReadUrl = lastReadUrl,
-                        lastChapterTitle = item.optString("lastChapterTitle").trim(),
+                        lastChapterTitle = cleanChapterTitle(item.optString("lastChapterTitle")),
                         updatedAt = item.optLong("updatedAt", 0L)
                     )
                 )

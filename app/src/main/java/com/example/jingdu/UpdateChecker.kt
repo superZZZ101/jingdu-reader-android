@@ -16,7 +16,7 @@ data class AppUpdateInfo(
 
 private const val UPDATE_REPOSITORY_OWNER = "superZZZ101"
 private const val UPDATE_REPOSITORY_NAME = "jingdu-reader-android"
-private const val UPDATE_ASSET_NAME = "jingdu-reader.apk"
+private const val UPDATE_ASSET_NAME = "app-release.apk"
 
 suspend fun checkForAppUpdate(currentVersionName: String): AppUpdateInfo? = withContext(Dispatchers.IO) {
     if (UPDATE_REPOSITORY_OWNER == "YOUR_GITHUB_USERNAME") return@withContext null

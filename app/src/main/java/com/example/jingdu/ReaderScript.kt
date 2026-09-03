@@ -3,7 +3,7 @@ package com.example.jingdu
 object ReaderScript {
     val extract = """
         (() => {
-          const NOISE = 'script,style,noscript,template,iframe,canvas,svg,nav,aside,header,footer,form,button,input,textarea,select,option,[role="navigation"],[role="complementary"],[aria-hidden="true"],[hidden],.ad,.ads,.advert,.advertisement,.adsbygoogle,.ad-container,[class*="ad-"],[class*="-ad"],[id*="ad-"],[id*="-ad"],.popup,.modal,.overlay,.recommend,.recommendation,.related,.share,.social,.comment,.comments,.toolbar,.pagination,.chapter-nav,.breadcrumb,.notice,.copyright';
+          const NOISE = 'script,style,noscript,template,iframe,canvas,svg,nav,aside,header,footer,form,button,input,textarea,select,option,[role="navigation"],[role="complementary"],[aria-hidden="true"],[hidden],.topbar,.header,.nav,.m-nav,.m-setting,.footer,.section-opt,.hotcmd-wp,.hotcmd-box,.ad,.ads,.advert,.advertisement,.adsbygoogle,.ad-container,[class*="ad-"],[class*="-ad"],[id*="ad-"],[id*="-ad"],.popup,.modal,.overlay,.recommend,.recommendation,.related,.share,.social,.comment,.comments,.toolbar,.pagination,.chapter-nav,.breadcrumb,.notice,.copyright';
           const CATALOG_CONTAINERS = '#list,#catalog,#chapter-list,#chapterList,#目录,.catalog,.catalog-list,.chapter-list,.chapterList,.chapter-list-box,.book-list,.book-chapter-list,.listmain,.volume-list,.directory,[class*="chapter-list"],[id*="chapter-list"]';
           const PAGE_CONTAINERS = '.pagination,.pager,.pages,.page,.page-list,.pageList,[class*="pagination"],[class*="pager"],[class*="page-list"],[id*="pagination"],[id*="pager"],[id*="page-list"]';
           const CATALOG_WORD = /(目录|章节目录|目录页|书目|catalog|contents?)/i;
@@ -97,7 +97,12 @@ object ReaderScript {
           }
 
           function findCandidate() {
-            const selectors = ['article','main','[role="main"]','#chaptercontent','#chapter-content','#content','.chapter-content','.chapterContent','.read-content','.readContent','.reading-content','.novel-content','.article-content','.content','.txtnav','.book-text','.book-content','.text-content'];
+            const selectors = ['article','main','[role="main"]','.reader-main','.read-main','#chaptercontent','#chapter-content','#content','.chapter-content','.chapterContent','.read-content','.readContent','.reading-content','.novel-content','.article-content','.content','.txtnav','.book-text','.book-content','.text-content'];
+            const preferred = ['#content','#chaptercontent','#chapter-content','.chapter-content','.chapterContent','.read-content','.readContent','.reading-content','.novel-content','.article-content','.content','.txtnav','.book-text','.book-content','.text-content'];
+            for (const selector of preferred) {
+              const element = document.querySelector(selector);
+              if (element && visible(element).replace(/\\s/g, '').length >= 80) return element;
+            }
             const candidates = [];
             const seen = new Set();
             for (const selector of selectors) {
@@ -133,15 +138,23 @@ object ReaderScript {
             const lines = raw.replace(/\r/g, '').replace(/\u00a0/g, ' ').split(/\n+/).map((line) => line.replace(/[ \t]+/g, ' ').trim()).filter(Boolean);
             const result = [];
             lines.forEach((line) => {
-              if (/^(上一章|下一章|目录|章节目录|加入书签|收藏本书|投推荐票|章节报错)$/.test(line) || /^(手机用户请|请记住本书(首发)?(域名|网址)|本章未完|最新网址)/.test(line) || /^(https?:\/\/|www\.)/i.test(line) || /^点击(下一页|阅读|下载|继续)/.test(line)) return;
+              if (/^(上一章|下一章|上一页|下一页|上页|下页|前页|后页|目录|书页(?:\/|\s*)目录|章节目录|加入书签|收藏本书|投推荐票|章节报错|没有了|书末页)$/i.test(line) ||
+                   (/^(上一章|下一章)\s*[:：]?/.test(line) && line.length < 260) ||
+                   /^(手机用户请|请记住本书(首发)?(域名|网址)|本章未完|最新网址)/.test(line) ||
+                   /^(https?:\/\/|www\.)/i.test(line) || /^点击(下一页|阅读|下载|继续)/.test(line) ||
+                   /如果被.{0,100}(强制|进入).{0,100}(阅读模式|转码阅读)|阅读体验极差请退出转码阅读/.test(line)) return;
               if (result.length && line.length < 5 && !/[。！？.!?：:]$/.test(result[result.length - 1])) result[result.length - 1] += line;
               else result.push(line);
             });
             return result;
           }
           function headingFor(candidate) {
-            const heading = candidate.querySelector('h1,h2,h3,.chapter-title,.chapterTitle,.title');
-            return heading ? clean(heading.textContent) : '';
+            const localHeading = candidate.querySelector('h1,h2,h3,.chapter-title,.chapterTitle,.title');
+            if (localHeading) return clean(localHeading.textContent);
+            const pageHeading = [...document.querySelectorAll('h1,h2,h3,.chapter-title,.chapterTitle,.title')]
+              .map((item) => clean(item.textContent))
+              .find((item) => CHAPTER_WORD.test(item));
+            return pageHeading || '';
           }
           function titleForCatalog() {
             const headings = [...document.querySelectorAll('h1,h2,h3')].map((item) => clean(item.textContent)).filter((item) => item.length >= 2 && item.length <= 120);
@@ -156,27 +169,49 @@ object ReaderScript {
             return patterns.rel.test(rel) || patterns.text.test(text) || patterns.hint.test(descriptor);
           }
           function findNavigation() {
-            const result = { previous: null, next: null, catalog: null };
-            const score = { previous: -Infinity, next: -Infinity, catalog: -Infinity };
+            const result = { previous: null, next: null, catalog: null, previousPage: null, nextPage: null };
+            const score = { previous: -Infinity, next: -Infinity, catalog: -Infinity, previousPage: -Infinity, nextPage: -Infinity };
             const patterns = {
-              previous: { rel: /(^|\s)(prev|previous|back)(\s|$)/i, text: /^(上一章|上章|上一节|前一章|上一页|prev(?:ious)?|back)$/i, hint: /上一章|上一节|前一章|上一页/i },
-              next: { rel: /(^|\s)(next|continue)(\s|$)/i, text: /^(下一章|下章|下一节|后一章|下一页|next|continue)$/i, hint: /下一章|下一节|后一章|下一页/i },
+              previous: { rel: /(^|\s)(prev|previous|back)(\s|$)/i, text: /^(上一章|上章|上一节|前一章|前一回|prev(?:ious)?|back)$/i, hint: /上一章|上一节|前一章|前一回/i },
+              next: { rel: /(^|\s)(next|continue)(\s|$)/i, text: /^(下一章|下章|下一节|后一章|后一回|next|continue)$/i, hint: /下一章|下一节|后一章|后一回/i },
+              previousPage: { rel: /(^|\s)(page[-_ ]?prev|prev[-_ ]?page)(\s|$)/i, text: /^(上一页|上页|前页|prev(?:ious)?\s*page)$/i, hint: /上一页|上页|前页/i },
+              nextPage: { rel: /(^|\s)(page[-_ ]?next|next[-_ ]?page)(\s|$)/i, text: /^(下一页|下页|后页|next\s*page)$/i, hint: /下一页|下页|后页/i },
               catalog: { rel: /(^|\s)(contents?|catalog)(\s|$)/i, text: /^(目录|章节目录|返回目录|书目|目录页|catalog|contents?)$/i, hint: /目录|书目|catalog|contents?/i }
             };
             for (const anchor of document.querySelectorAll('a[href]')) {
               if (anchor.closest('#rm-root') || hidden(anchor)) continue;
               const href = urlFor(anchor);
               if (!href) continue;
-              for (const kind of Object.keys(patterns)) {
+              const label = labelFor(anchor);
+              const descriptor = label + ' ' + anchor.id + ' ' + anchor.className + ' ' + (anchor.getAttribute('aria-label') || '');
+              const pageKind = patterns.previousPage.text.test(label) || patterns.previousPage.hint.test(descriptor)
+                ? 'previousPage'
+                : patterns.nextPage.text.test(label) || patterns.nextPage.hint.test(descriptor)
+                  ? 'nextPage'
+                  : null;
+              if (pageKind) {
+                if (patterns[pageKind].text.test(label) && score[pageKind] < 120) {
+                  score[pageKind] = 120;
+                  result[pageKind] = { label, href };
+                } else if (score[pageKind] < 60) {
+                  score[pageKind] = 60;
+                  result[pageKind] = { label, href };
+                }
+                continue;
+              }
+              for (const kind of ['previous', 'next', 'catalog']) {
                 if (!sameLink(anchor, patterns[kind])) continue;
-                const descriptor = labelFor(anchor) + ' ' + anchor.id + ' ' + anchor.className;
-                const value = patterns[kind].text.test(labelFor(anchor)) ? 100 : 50 + (patterns[kind].hint.test(descriptor) ? 30 : 0);
-                if (value > score[kind]) { score[kind] = value; result[kind] = { label: labelFor(anchor), href }; }
+                const value = patterns[kind].text.test(label) ? 100 : 50 + (patterns[kind].hint.test(descriptor) ? 30 : 0);
+                if (value > score[kind]) { score[kind] = value; result[kind] = { label, href }; }
               }
             }
             return result;
           }
 
+          const browserErrorText = clean((document.title || '') + ' ' + visible(document.body));
+          if (/ERR_[A-Z_]+|网页无法打开|无法加载此网页|无法连接到该网站|This site can.?t be reached|connection refused/i.test(browserErrorText)) {
+            return JSON.stringify({ sourceUrl: location.href, title: '网页无法打开', paragraphs: [], catalogItems: [], catalogPages: [], navigation: findNavigation() });
+          }
           const candidate = findCandidate();
           const catalogItems = findCatalogItems();
           const catalogPages = catalogItems.length ? findCatalogPages() : [];
