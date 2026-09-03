@@ -378,13 +378,8 @@ private fun JingduApp(initialUrl: String = "") {
         previousLoadUrl = if (previous.isNotEmpty() && !previousReady && !sameUrl(previous, result.sourceUrl)) previous else ""
     }
 
-    fun prepareCatalog(result: ReaderDocument) {
-        if (result.isCatalog) {
-            catalogLoadUrl = ""
-            return
-        }
-        val catalog = result.navigation.catalog?.href?.let(::normalizeUrl).orEmpty()
-        catalogLoadUrl = if (catalog.isNotEmpty() && findCached(catalog) == null && !sameUrl(catalog, result.sourceUrl)) catalog else ""
+    fun prepareCatalog() {
+        catalogLoadUrl = ""
     }
 
     fun updateShelfForDocument(result: ReaderDocument) {
@@ -474,7 +469,7 @@ private fun JingduApp(initialUrl: String = "") {
         pruneCache(displayResult, previousDocument)
         preparePrevious(displayResult)
         prepareNext(displayResult)
-        prepareCatalog(displayResult)
+        prepareCatalog()
     }
 
     fun openUrl(
@@ -544,7 +539,7 @@ private fun JingduApp(initialUrl: String = "") {
             saveCachedReaderDocument(preferences, cached)
             preparePrevious(cached)
             prepareNext(cached)
-            prepareCatalog(cached)
+            prepareCatalog()
             return
         }
         if (cached != null) {
@@ -623,7 +618,7 @@ private fun JingduApp(initialUrl: String = "") {
                     pruneCache(merged, previousDocument)
                     preparePrevious(merged)
                     prepareNext(merged)
-                    prepareCatalog(merged)
+                    prepareCatalog()
                 }
                 return
             }
@@ -672,16 +667,18 @@ private fun JingduApp(initialUrl: String = "") {
                 activeRetryUrl = ""
                 activeRetryCount = 0
                 activeRetryScheduled = false
+                if (document == null || document != result) {
+                    showDocument(
+                        result,
+                        expected,
+                        pending?.position,
+                        pending?.catalogUrl,
+                        pending?.catalogIndex,
+                        pending?.verticalIndex,
+                        pending?.verticalOffset
+                    )
+                }
                 pendingChapterNavigation = null
-                showDocument(
-                    result,
-                    expected,
-                    pending?.position,
-                    pending?.catalogUrl,
-                    pending?.catalogIndex,
-                    pending?.verticalIndex,
-                    pending?.verticalOffset
-                )
                 accepted = true
             }
         }
@@ -1145,6 +1142,7 @@ private fun createReaderWebView(
             fun scheduleExtraction(view: WebView, url: String, requestToken: Long, delayMillis: Long) {
                 view.postDelayed({
                     if (requestToken != webViewLoadToken(view)) return@postDelayed
+                    if (acceptedPayloadToken == requestToken) return@postDelayed
                     val currentUrl = view.url.orEmpty()
                     if (currentUrl.isNotEmpty() && !sameUrl(currentUrl, url)) return@postDelayed
                     view.evaluateJavascript(ReaderScript.extract) { rawPayload ->
@@ -1833,7 +1831,7 @@ private fun CatalogDrawer(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
-                                    "第${index + 1}章",
+                                    catalogNumberLabel(item.label),
                                     color = if (selected) palette.accent else palette.muted,
                                     fontSize = 10.sp,
                                     modifier = Modifier.width(54.dp)
@@ -2755,6 +2753,8 @@ private fun chapterNumber(value: String): String? {
         .find(value)
     return match?.groupValues?.drop(1)?.firstOrNull { it.isNotEmpty() }
 }
+
+private fun catalogNumberLabel(label: String): String = chapterNumber(label)?.let { "第${it}章" } ?: "章节"
 
 private fun chapterTitleKey(value: String): String = value
     .substringBefore('_')

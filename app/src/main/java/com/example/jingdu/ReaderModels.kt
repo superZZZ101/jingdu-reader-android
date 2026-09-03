@@ -77,7 +77,9 @@ private fun JSONObject.optLinkList(name: String): List<ReaderLink> {
     val values = optJSONArray(name) ?: return emptyList()
     return buildList(values.length()) {
         for (index in 0 until values.length()) {
-            values.optJSONObject(index)?.toReaderLink()?.let(::add)
+            values.optJSONObject(index)?.toReaderLink()?.let { link ->
+                add(if (name == "catalogItems") link.copy(label = cleanChapterTitle(link.label)) else link)
+            }
         }
     }
 }
@@ -204,7 +206,7 @@ fun loadShelfBooks(preferences: SharedPreferences): List<ShelfBook> {
                 add(
                     ShelfBook(
                         key = key,
-                        title = item.optString("title", "未命名书籍").trim().ifEmpty { "未命名书籍" },
+                        title = cleanChapterTitle(item.optString("title", "未命名书籍")).ifEmpty { "未命名书籍" },
                         catalogUrl = item.optString("catalogUrl").trim(),
                         lastReadUrl = lastReadUrl,
                         lastChapterTitle = cleanChapterTitle(item.optString("lastChapterTitle")),
