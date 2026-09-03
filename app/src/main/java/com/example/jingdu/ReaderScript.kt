@@ -69,10 +69,11 @@ object ReaderScript {
             let bestScore = -1;
             for (const container of containers) {
               const items = collectCatalogItems(container);
-              if (items.length < 4) continue;
+              if (!items.length) continue;
               const containerHint = container.id + ' ' + container.className;
               const marked = CATALOG_WORD.test(pageHint) || CATALOG_CONTAINER_WORD.test(containerHint);
               const bodyLooksLikeCatalog = container === document.body && items.length >= 8 && visible(document.body).length < items.length * 90;
+              if (container === document.body && items.length < 4) continue;
               if (!marked && !bodyLooksLikeCatalog) continue;
               const score = items.length * 12 + (marked ? 240 : 0) + (container !== document.body ? 120 : 0);
               if (score > bestScore) { bestScore = score; best = items; }
@@ -215,7 +216,7 @@ object ReaderScript {
           const candidate = findCandidate();
           const catalogItems = findCatalogItems();
           const catalogPages = catalogItems.length ? findCatalogPages() : [];
-          const isCatalog = catalogItems.length >= 4;
+          const isCatalog = catalogItems.length > 0;
           const heading = headingFor(candidate);
           const title = isCatalog ? titleForCatalog() : (heading || clean(document.title) || '未识别标题');
           const clone = candidate.cloneNode(true);

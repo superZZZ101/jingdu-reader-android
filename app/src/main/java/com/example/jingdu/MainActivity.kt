@@ -38,7 +38,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.lazy.items
@@ -302,6 +301,11 @@ private fun JingduApp(initialUrl: String = "") {
     var prefetchLoadUrl by remember { mutableStateOf("") }
     var previousLoadUrl by remember { mutableStateOf("") }
     var catalogLoadUrl by remember { mutableStateOf("") }
+    var catalogAggregateUrl by remember { mutableStateOf("") }
+    var catalogLoadedUrls by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var catalogLoadedPageCount by remember { mutableStateOf(0) }
+    var catalogComplete by remember { mutableStateOf(false) }
+    var catalogErrorMessage by remember { mutableStateOf<String?>(null) }
     var activeCatalogUrl by remember { mutableStateOf("") }
     var activeCatalogIndex by remember { mutableStateOf<Int?>(null) }
     var chapterOpenPosition by remember { mutableStateOf<ChapterOpenPosition?>(null) }
@@ -416,8 +420,106 @@ private fun JingduApp(initialUrl: String = "") {
         previousLoadUrl = if (previous.isNotEmpty() && !previousReady && !sameUrl(previous, result.sourceUrl)) previous else ""
     }
 
-    fun prepareCatalog() {
-        catalogLoadUrl = ""
+    fun catalogPageKey(url: String): String = cacheKey(normalizeUrl(url))
+
+    fun nextCatalogPage(catalog: ReaderDocument, loaded: Set<String>): String? =
+        catalog.catalogPages
+            .asSequence()
+            .map { normalizeUrl(it.href) }
+            .filter { it.isNotEmpty() }
+            .firstOrNull { catalogPageKey(it) !in loaded && !sameUrl(it, catalog.sourceUrl) }
+
+    fun startCatalogCrawl(rawRootUrl: String, seed: ReaderDocument? = null) {
+        val rootUrl = normalizeUrl(rawRootUrl)
+        if (rootUrl.isEmpty()) return
+        val sameRoot = catalogAggregateUrl.isNotEmpty() && sameUrl(catalogAggregateUrl, rootUrl)
+        if (!sameRoot) {
+            catalogAggregateUrl = rootUrl
+            catalogLoadedUrls = emptySet()
+            catalogLoadedPageCount = 0
+            catalogComplete = false
+            catalogErrorMessage = null
+        }
+
+        val rootDocument = seed?.takeIf { it.isCatalog } ?: findCached(rootUrl)
+        if (rootDocument != null && rootDocument.isCatalog) {
+            val cachedPageKeys = rootDocument.catalogPages
+                .map { catalogPageKey(it.href) }
+                .filter { it.isNotEmpty() }
+                .filter { findCached(it)?.isCatalog == true }
+                .toSet()
+            val rootKey = catalogPageKey(rootDocument.sourceUrl).ifEmpty { catalogPageKey(rootUrl) }
+            val loaded = catalogLoadedUrls + rootKey + cachedPageKeys
+            catalogLoadedUrls = loaded
+            catalogLoadedPageCount = loaded.size
+            cacheDocument(rootDocument, rootUrl)
+            val next = nextCatalogPage(rootDocument, loaded)
+            catalogErrorMessage = null
+            catalogComplete = next == null
+            catalogLoadUrl = next.orEmpty()
+            if (next != null && sameUrl(catalogWebView?.url.orEmpty(), next)) {
+                catalogWebView?.let { view ->
+                    view.stopLoading()
+                    startWebViewLoad(view, next)
+                }
+            }
+        } else {
+            catalogLoadedUrls = emptySet()
+            catalogLoadedPageCount = 0
+            catalogComplete = false
+            catalogErrorMessage = null
+            catalogLoadUrl = rootUrl
+            if (sameUrl(catalogWebView?.url.orEmpty(), rootUrl)) {
+                catalogWebView?.let { view ->
+                    view.stopLoading()
+                    startWebViewLoad(view, rootUrl)
+                }
+            }
+        }
+    }
+
+    fun updateShelfTitleFromCatalog(catalogUrl: String, catalog: ReaderDocument) {
+        if (!catalog.isCatalog) return
+        val current = document?.takeUnless { it.isCatalog } ?: return
+        val key = shelfKeyForDocument(current)
+        val existing = shelfBooks.firstOrNull {
+            it.key == key || (it.catalogUrl.isNotBlank() && sameUrl(it.catalogUrl, catalogUrl))
+        } ?: return
+        val updated = existing.copy(
+            title = bookTitleForDocument(current, catalog),
+            updatedAt = System.currentTimeMillis()
+        )
+        shelfBooks = listOf(updated) + shelfBooks.filterNot { it.key == existing.key }
+        saveShelfBooks(preferences, shelfBooks)
+    }
+
+    fun acceptCatalogPage(result: ReaderDocument, expected: String) {
+        val rootUrl = catalogAggregateUrl.takeIf { it.isNotEmpty() }
+            ?: activeCatalogUrl.takeIf { it.isNotEmpty() }
+            ?: expected
+        val existing = findCached(rootUrl)?.takeIf { it.isCatalog }
+        cacheDocument(result, expected)
+        val merged = if (existing != null) mergeCatalogDocuments(existing, result) else result
+        cacheDocument(merged, rootUrl)
+
+        val loadedBefore = catalogLoadedUrls
+        val loadedAfter = loadedBefore + catalogPageKey(expected) + catalogPageKey(result.sourceUrl)
+        catalogLoadedUrls = loadedAfter
+        catalogLoadedPageCount += loadedAfter.size - loadedBefore.size
+        catalogErrorMessage = null
+        updateShelfTitleFromCatalog(rootUrl, merged)
+
+        if (document?.isCatalog == true && (
+                sameUrl(document?.sourceUrl.orEmpty(), rootUrl) || sameUrl(document?.sourceUrl.orEmpty(), expected)
+            )) {
+            document = merged
+            currentUrl = merged.sourceUrl
+            address = merged.sourceUrl
+        }
+
+        val next = nextCatalogPage(merged, loadedAfter)
+        catalogComplete = next == null
+        catalogLoadUrl = next.orEmpty()
     }
 
     fun updateShelfForDocument(result: ReaderDocument) {
@@ -433,21 +535,6 @@ private fun JingduApp(initialUrl: String = "") {
             updatedAt = System.currentTimeMillis()
         )
         shelfBooks = listOf(updated) + shelfBooks.filterNot { it.key == key }
-        saveShelfBooks(preferences, shelfBooks)
-    }
-
-    fun updateShelfTitleFromCatalog(catalogUrl: String, catalog: ReaderDocument) {
-        if (!catalog.isCatalog) return
-        val current = document?.takeUnless { it.isCatalog } ?: return
-        val key = shelfKeyForDocument(current)
-        val existing = shelfBooks.firstOrNull {
-            it.key == key || (it.catalogUrl.isNotBlank() && sameUrl(it.catalogUrl, catalogUrl))
-        } ?: return
-        val updated = existing.copy(
-            title = bookTitleForDocument(current, catalog),
-            updatedAt = System.currentTimeMillis()
-        )
-        shelfBooks = listOf(updated) + shelfBooks.filterNot { it.key == existing.key }
         saveShelfBooks(preferences, shelfBooks)
     }
 
@@ -478,7 +565,7 @@ private fun JingduApp(initialUrl: String = "") {
         shelfBooks = listOf(updated) + shelfBooks.filterNot { it.key == key }
         saveShelfBooks(preferences, shelfBooks)
         if (catalog == null && catalogUrl.isNotBlank()) {
-            catalogLoadUrl = catalogUrl
+            startCatalogCrawl(catalogUrl)
         }
     }
 
@@ -517,7 +604,10 @@ private fun JingduApp(initialUrl: String = "") {
         verticalOpenIndex = verticalIndexOverride
         verticalOpenOffset = verticalOffsetOverride
         activeLoadUrl = ""
-        if (!displayResult.isCatalog) {
+        if (displayResult.isCatalog) {
+            activeCatalogUrl = normalizeUrl(displayResult.sourceUrl)
+            if (catalogIndexOverride != null) activeCatalogIndex = catalogIndexOverride
+        } else {
             activeCatalogUrl = catalogUrlOverride?.let(::normalizeUrl)?.takeIf { it.isNotEmpty() }
                 ?: displayResult.navigation.catalog?.href?.let(::normalizeUrl).orEmpty()
             if (catalogIndexOverride != null) activeCatalogIndex = catalogIndexOverride
@@ -525,7 +615,7 @@ private fun JingduApp(initialUrl: String = "") {
         pruneCache(displayResult, previousDocument)
         preparePrevious(displayResult)
         prepareNext(displayResult)
-        prepareCatalog()
+        if (displayResult.isCatalog) startCatalogCrawl(displayResult.sourceUrl, displayResult)
     }
 
     fun openUrl(
@@ -595,7 +685,6 @@ private fun JingduApp(initialUrl: String = "") {
             saveCachedReaderDocument(preferences, cached)
             preparePrevious(cached)
             prepareNext(cached)
-            prepareCatalog()
             return
         }
         if (cached != null) {
@@ -674,7 +763,6 @@ private fun JingduApp(initialUrl: String = "") {
                     pruneCache(merged, previousDocument)
                     preparePrevious(merged)
                     prepareNext(merged)
-                    prepareCatalog()
                 }
                 return
             }
@@ -865,17 +953,24 @@ private fun JingduApp(initialUrl: String = "") {
         val tokenMatches = requestToken != 0L && requestToken == webViewLoadToken(catalogWebView)
         val matches = expected.isNotEmpty() && tokenMatches &&
             (sameUrl(pageUrl, expected) || (result != null && sameUrl(result.sourceUrl, expected)))
-        if (matches && result != null) {
-            cacheDocument(result, expected)
-            updateShelfTitleFromCatalog(expected, result)
+        if (matches && result?.isCatalog == true) {
+            acceptCatalogPage(result, expected)
+            true
+        } else if (matches) {
             catalogLoadUrl = ""
+            catalogComplete = false
+            catalogErrorMessage = "目录暂时无法读取，请点击重试"
             true
         } else {
             false
         }
     }
     val catalogErrorState = rememberUpdatedState<(String) -> Unit> { pageUrl ->
-        if (catalogLoadUrl.isNotEmpty() && sameUrl(pageUrl, catalogLoadUrl)) catalogLoadUrl = ""
+        if (catalogLoadUrl.isNotEmpty() && sameUrl(pageUrl, catalogLoadUrl)) {
+            catalogLoadUrl = ""
+            catalogComplete = false
+            catalogErrorMessage = "目录暂时无法读取，请点击重试"
+        }
     }
 
     LaunchedEffect(activeWebView, activeLoadUrl) {
@@ -1028,6 +1123,9 @@ private fun JingduApp(initialUrl: String = "") {
                     catalogDocument = cachedCatalog,
                     catalogIndex = activeCatalogIndex,
                     catalogLoading = catalogLoadUrl.isNotEmpty(),
+                    catalogLoadedPageCount = catalogLoadedPageCount,
+                    catalogComplete = catalogComplete,
+                    catalogError = catalogErrorMessage,
                     isInBookshelf = currentBookInShelf,
                     onAddToBookshelf = { addCurrentBookToShelf() },
                     onSettingsChange = {
@@ -1051,20 +1149,12 @@ private fun JingduApp(initialUrl: String = "") {
                     },
                     onOpenCatalog = {
                         val catalogUrl = activeCatalogUrl.takeIf { it.isNotEmpty() } ?: baseCatalogUrl
-                        if (catalogUrl.isNotEmpty() && findCached(catalogUrl) == null) {
-                            catalogLoadUrl = catalogUrl
-                            if (sameUrl(catalogWebView?.url.orEmpty(), catalogUrl)) catalogWebView?.reload()
-                        }
+                        if (catalogUrl.isNotEmpty()) startCatalogCrawl(catalogUrl)
+
                     },
-                    onCatalogNavigate = { href ->
-                        val catalogUrl = normalizeUrl(href)
-                        if (catalogUrl.isNotEmpty()) {
-                            activeCatalogIndex = null
-                            activeCatalogUrl = catalogUrl
-                            val cached = findCached(catalogUrl)
-                            catalogLoadUrl = if (cached == null) catalogUrl else ""
-                            if (cached == null && sameUrl(catalogWebView?.url.orEmpty(), catalogUrl)) catalogWebView?.reload()
-                        }
+                    onRetryCatalog = {
+                        val catalogUrl = activeCatalogUrl.takeIf { it.isNotEmpty() } ?: baseCatalogUrl
+                        if (catalogUrl.isNotEmpty()) startCatalogCrawl(catalogUrl)
                     },
                     onClose = {
                         document?.takeUnless { current -> current.isCatalog }?.let { current ->
@@ -1458,6 +1548,9 @@ private fun ReaderScreen(
     catalogDocument: ReaderDocument?,
     catalogIndex: Int?,
     catalogLoading: Boolean,
+    catalogLoadedPageCount: Int,
+    catalogComplete: Boolean,
+    catalogError: String?,
     isInBookshelf: Boolean,
     onAddToBookshelf: () -> Unit,
     onSettingsChange: (ReaderSettings) -> Unit,
@@ -1467,7 +1560,7 @@ private fun ReaderScreen(
     onContinueToChapter: (String, Int, Int) -> Unit,
     onNavigateFromCatalog: (String, String, Int) -> Unit,
     onOpenCatalog: () -> Unit,
-    onCatalogNavigate: (String) -> Unit,
+    onRetryCatalog: () -> Unit,
     onClose: () -> Unit,
     onReload: () -> Unit
 ) {
@@ -1496,7 +1589,17 @@ private fun ReaderScreen(
                 loading -> LoadingView(palette)
                 errorMessage != null -> ErrorView(errorMessage, palette, onReload)
                 document == null -> LoadingView(palette)
-                document.isCatalog -> CatalogView(document, palette, settings, onNavigate)
+                document.isCatalog -> CatalogView(
+                    document = document,
+                    palette = palette,
+                    settings = settings,
+                    catalogLoading = catalogLoading,
+                    catalogLoadedPageCount = catalogLoadedPageCount,
+                    catalogComplete = catalogComplete,
+                    catalogError = catalogError,
+                    onRetryCatalog = onRetryCatalog,
+                    onNavigate = onNavigate
+                )
                 else -> ChapterView(
                     document = document,
                     palette = palette,
@@ -1570,6 +1673,9 @@ private fun ReaderScreen(
                     currentDocument = document,
                     catalogDocument = catalogDocument,
                     catalogIndex = catalogIndex,
+                     loadedPageCount = catalogLoadedPageCount,
+                     complete = catalogComplete,
+                     errorMessage = catalogError,
                     loading = catalogLoading,
                     palette = palette,
                     settings = settings,
@@ -1577,7 +1683,7 @@ private fun ReaderScreen(
                         panel = ReaderPanel.NONE.name
                         onNavigateFromCatalog(href, catalogDocument?.sourceUrl.orEmpty(), index)
                     },
-                    onCatalogNavigate = onCatalogNavigate,
+                onRetryCatalog = onRetryCatalog,
                     onClose = { panel = ReaderPanel.NONE.name },
                     modifier = Modifier.align(Alignment.CenterStart)
                 )
@@ -1816,8 +1922,11 @@ private fun CatalogDrawer(
     palette: ReaderPalette,
     settings: ReaderSettings,
     catalogIndex: Int?,
+    loadedPageCount: Int,
+    complete: Boolean,
+    errorMessage: String?,
     onNavigate: (String, Int) -> Unit,
-    onCatalogNavigate: (String) -> Unit,
+    onRetryCatalog: () -> Unit,
     onClose: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -1893,6 +2002,19 @@ private fun CatalogDrawer(
                             Column(modifier = Modifier.padding(horizontal = 17.dp, vertical = 5.dp)) {
                                 Text(catalogDocument.title, color = palette.accent, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                                 Text("${catalogDocument.catalogItems.size} 个章节", color = palette.muted, fontSize = 10.sp)
+                                when {
+                                    loading -> Text("正在自动加载全部目录（已加载 ${loadedPageCount} 页）", color = palette.muted, fontSize = 10.sp)
+                                    errorMessage != null -> Column {
+                                        Text(errorMessage, color = palette.muted, fontSize = 10.sp)
+                                        TextButton(
+                                            onClick = onRetryCatalog,
+                                            contentPadding = PaddingValues(0.dp)
+                                        ) {
+                                            Text("重试自动加载", color = palette.accent, fontSize = 10.sp)
+                                        }
+                                    }
+                                    complete -> Text("目录已全部加载", color = palette.muted, fontSize = 10.sp)
+                                }
                             }
                         }
                         itemsIndexed(
@@ -1931,28 +2053,22 @@ private fun CatalogDrawer(
                                 }
                             }
                         }
-                        if (catalogDocument.catalogPages.isNotEmpty()) {
-                            item {
-                                Column(modifier = Modifier.padding(horizontal = 17.dp, vertical = 16.dp)) {
-                                    Text("目录分页", color = palette.muted, fontSize = 11.sp)
-                                    catalogDocument.catalogPages.forEach { page ->
-                                        TextButton(
-                                            onClick = { onCatalogNavigate(page.href) },
-                                            modifier = Modifier.fillMaxWidth(),
-                                            contentPadding = PaddingValues(vertical = 4.dp)
-                                        ) {
-                                            Text(page.label, color = palette.accent, modifier = Modifier.fillMaxWidth())
-                                        }
-                                    }
-                                }
-                            }
-                        }
                     }
                     loading -> Box(modifier = Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                        Text("目录正在预加载…", color = palette.muted, fontSize = 13.sp)
+                        Text("目录正在自动加载（已加载 ${loadedPageCount} 页）", color = palette.muted, fontSize = 13.sp)
                     }
-                    else -> Box(modifier = Modifier.weight(1f).fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
-                        Text("目录暂时无法读取", color = palette.muted, fontSize = 13.sp)
+                    else -> Column(
+                        modifier = Modifier.weight(1f).fillMaxWidth().padding(24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        Text(errorMessage ?: "目录暂时无法读取", color = palette.muted, fontSize = 13.sp)
+                        Spacer(Modifier.height(8.dp))
+                        TextButton(onClick = onRetryCatalog) {
+                            Icon(Icons.Default.Refresh, contentDescription = null)
+                            Spacer(Modifier.width(6.dp))
+                            Text("重试自动加载")
+                        }
                     }
                 }
             }
@@ -2054,6 +2170,11 @@ private fun CatalogView(
     document: ReaderDocument,
     palette: ReaderPalette,
     settings: ReaderSettings,
+    catalogLoading: Boolean,
+    catalogLoadedPageCount: Int,
+    catalogComplete: Boolean,
+    catalogError: String?,
+    onRetryCatalog: () -> Unit,
     onNavigate: (String) -> Unit
 ) {
     val listState = rememberLazyListState()
@@ -2080,6 +2201,21 @@ private fun CatalogView(
             Text(document.title, color = palette.ink, fontSize = 29.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp))
             Text("${document.catalogItems.size} 个章节", color = palette.muted, fontSize = 12.sp)
+            when {
+                catalogLoading -> Text("正在自动加载全部目录（已加载 ${catalogLoadedPageCount} 页）", color = palette.muted, fontSize = 11.sp)
+                catalogError != null -> {
+                    Text(catalogError, color = palette.muted, fontSize = 11.sp)
+                    TextButton(
+                        onClick = onRetryCatalog,
+                        contentPadding = PaddingValues(0.dp)
+                    ) {
+                        Icon(Icons.Default.Refresh, contentDescription = null)
+                        Spacer(Modifier.width(6.dp))
+                        Text("重试自动加载", color = palette.accent, fontSize = 11.sp)
+                    }
+                }
+                catalogComplete -> Text("目录已全部加载", color = palette.muted, fontSize = 11.sp)
+            }
             Spacer(Modifier.height(22.dp))
         }
         itemsIndexed(document.catalogItems, key = { index, item -> "${index}_${item.href}" }) { index, item ->
@@ -2094,24 +2230,6 @@ private fun CatalogView(
                 Text(String.format("%03d", index + 1), color = palette.muted, fontSize = 10.sp, modifier = Modifier.width(38.dp))
                 Text(item.label, color = palette.ink, fontSize = settings.fontSize.sp, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Icon(Icons.Default.ArrowForward, contentDescription = "打开章节", tint = palette.accent, modifier = Modifier.size(17.dp))
-            }
-        }
-        if (document.catalogPages.isNotEmpty()) {
-            item {
-                Spacer(Modifier.height(25.dp))
-                Text("目录分页", color = palette.muted, fontSize = 11.sp)
-                Spacer(Modifier.height(8.dp))
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                    items(document.catalogPages, key = { it.href }) { page ->
-                        OutlinedButton(
-                            onClick = { onNavigate(page.href) },
-                            contentPadding = PaddingValues(horizontal = 12.dp),
-                            shape = RoundedCornerShape(7.dp),
-                            border = BorderStroke(1.dp, palette.border),
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = palette.accent)
-                        ) { Text(page.label, fontSize = 11.sp) }
-                    }
-                }
             }
         }
         item { Spacer(Modifier.height(48.dp)) }

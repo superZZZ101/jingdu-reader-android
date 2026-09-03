@@ -36,6 +36,28 @@ data class ReaderDocument(
         }
 }
 
+fun mergeCatalogDocuments(base: ReaderDocument, page: ReaderDocument): ReaderDocument {
+    val items = LinkedHashMap<String, ReaderLink>()
+    val pages = LinkedHashMap<String, ReaderLink>()
+    fun addLinks(target: LinkedHashMap<String, ReaderLink>, links: List<ReaderLink>) {
+        links.forEach { link ->
+            val key = link.href.trim().substringBefore('#').trimEnd('/').ifEmpty { link.href.trim() }
+            if (!target.containsKey(key)) target[key] = link
+        }
+    }
+    addLinks(items, base.catalogItems)
+    addLinks(items, page.catalogItems)
+    addLinks(pages, base.catalogPages)
+    addLinks(pages, page.catalogPages)
+    return base.copy(
+        catalogItems = items.values.toList(),
+        catalogPages = pages.values.toList(),
+        navigation = base.navigation.copy(
+            catalog = base.navigation.catalog ?: page.navigation.catalog
+        )
+    )
+}
+
 fun parseReaderPayload(raw: String): ReaderDocument? {
     val payload = runCatching {
         val value = JSONTokener(raw).nextValue()
