@@ -134,6 +134,10 @@ private fun isReaderNoiseParagraph(raw: String): Boolean {
         Regex("^(上一章|下一章|上一页|下一页|上页|下页|前页|后页|书页/?目录|目录|章节目录|加入书签|收藏本书|投推荐票|章节报错).{0,280}$")
     ) || (normalized.startsWith("上一章") || normalized.startsWith("下一章")) && normalized.length < 280 ||
         normalized.contains("阅读体验极差") ||
+        normalized.contains("正在进行安全验证") ||
+        normalized.contains("安全服务防护恶意自动程序") ||
+        normalized.contains("验证您不是自动程序") ||
+        normalized.contains("请开启浏览器无痕模式后重试") ||
         normalized.startsWith("如果被") && normalized.contains("阅读模式") ||
         normalized.matches(Regex("^(网页无法打开|无法加载此网页|无法连接到该网站|This site can.?t be reached|ERR_[A-Z_]+).*$", RegexOption.IGNORE_CASE))
 }

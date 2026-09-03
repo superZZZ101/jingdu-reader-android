@@ -798,38 +798,9 @@ private fun JingduApp(initialUrl: String = "") {
         }
     }
 
-    val activePayloadState = rememberUpdatedState<(Long, String, String) -> Boolean> { requestToken, pageUrl, rawPayload ->
-        var accepted = false
-        val expected = activeLoadUrl
-        val result = parseReaderPayload(rawPayload)
-        val tokenMatches = requestToken != 0L && requestToken == webViewLoadToken(activeWebView)
-        val matches = expected.isNotEmpty() && tokenMatches &&
-            (sameUrl(pageUrl, expected) || (result != null && sameUrl(result.sourceUrl, expected)))
-        if (matches) {
-            val pending = pendingChapterNavigation
-            if ((pending == null || sameUrl(pending.url, expected)) && result?.isUsableForReading() == true) {
-                activeRetryUrl = ""
-                activeRetryCount = 0
-                activeRetryScheduled = false
-                if (document == null || document != result) {
-                    showDocument(
-                        result,
-                        expected,
-                        pending?.position,
-                        pending?.catalogUrl,
-                        pending?.catalogIndex,
-                        pending?.verticalIndex,
-                        pending?.verticalOffset
-                    )
-                }
-                pendingChapterNavigation = null
-                accepted = true
-            }
-        }
-        accepted
-    }
-    val activeErrorState = rememberUpdatedState<(String) -> Unit> { pageUrl ->
-        if (activeLoadUrl.isNotEmpty() && sameUrl(pageUrl, activeLoadUrl)) {
+    fun handleActiveError(requestToken: Long, pageUrl: String) {
+        if (requestToken != 0L && requestToken == webViewLoadToken(activeWebView) &&
+            activeLoadUrl.isNotEmpty() && sameUrl(pageUrl, activeLoadUrl)) {
             val failedUrl = activeLoadUrl
             if (activeRetryUrl != failedUrl) {
                 activeRetryUrl = failedUrl
@@ -857,6 +828,42 @@ private fun JingduApp(initialUrl: String = "") {
             }
         }
     }
+
+    val activePayloadState = rememberUpdatedState<(Long, String, String) -> Boolean> { requestToken, pageUrl, rawPayload ->
+        var accepted = false
+        val expected = activeLoadUrl
+        val result = parseReaderPayload(rawPayload)
+        val tokenMatches = requestToken != 0L && requestToken == webViewLoadToken(activeWebView)
+        val matches = expected.isNotEmpty() && tokenMatches &&
+            (sameUrl(pageUrl, expected) || (result != null && sameUrl(result.sourceUrl, expected)))
+        if (matches) {
+            val pending = pendingChapterNavigation
+            if ((pending == null || sameUrl(pending.url, expected)) && result?.isUsableForReading() == true) {
+                activeRetryUrl = ""
+                activeRetryCount = 0
+                activeRetryScheduled = false
+                if (document == null || document != result) {
+                    showDocument(
+                        result,
+                        expected,
+                        pending?.position,
+                        pending?.catalogUrl,
+                        pending?.catalogIndex,
+                        pending?.verticalIndex,
+                        pending?.verticalOffset
+                    )
+                }
+                pendingChapterNavigation = null
+                accepted = true
+            } else {
+                handleActiveError(requestToken, pageUrl)
+            }
+        }
+        accepted
+    }
+    val activeErrorState = rememberUpdatedState<(Long, String) -> Unit> { requestToken, pageUrl ->
+        handleActiveError(requestToken, pageUrl)
+    }
     val prefetchPayloadState = rememberUpdatedState<(Long, String, String) -> Boolean> { requestToken, pageUrl, rawPayload ->
         var accepted = false
         val expected = prefetchLoadUrl
@@ -873,8 +880,9 @@ private fun JingduApp(initialUrl: String = "") {
         }
         accepted
     }
-    val prefetchErrorState = rememberUpdatedState<(String) -> Unit> { pageUrl ->
-        if (prefetchLoadUrl.isNotEmpty() && sameUrl(pageUrl, prefetchLoadUrl)) {
+    val prefetchErrorState = rememberUpdatedState<(Long, String) -> Unit> { requestToken, pageUrl ->
+        if (requestToken != 0L && requestToken == webViewLoadToken(prefetchWebView) &&
+            prefetchLoadUrl.isNotEmpty() && sameUrl(pageUrl, prefetchLoadUrl)) {
             val failedUrl = prefetchLoadUrl
             if (prefetchRetryUrl != failedUrl) {
                 prefetchRetryUrl = failedUrl
@@ -939,8 +947,9 @@ private fun JingduApp(initialUrl: String = "") {
         }
         accepted
     }
-    val previousErrorState = rememberUpdatedState<(String) -> Unit> { pageUrl ->
-        if (previousLoadUrl.isNotEmpty() && sameUrl(pageUrl, previousLoadUrl)) {
+    val previousErrorState = rememberUpdatedState<(Long, String) -> Unit> { requestToken, pageUrl ->
+        if (requestToken != 0L && requestToken == webViewLoadToken(previousWebView) &&
+            previousLoadUrl.isNotEmpty() && sameUrl(pageUrl, previousLoadUrl)) {
             val failedUrl = previousPageBaseUrl.takeIf { it.isNotEmpty() } ?: previousLoadUrl
             previousLoadUrl = ""
             previousPageBaseUrl = ""
@@ -965,8 +974,9 @@ private fun JingduApp(initialUrl: String = "") {
             false
         }
     }
-    val catalogErrorState = rememberUpdatedState<(String) -> Unit> { pageUrl ->
-        if (catalogLoadUrl.isNotEmpty() && sameUrl(pageUrl, catalogLoadUrl)) {
+    val catalogErrorState = rememberUpdatedState<(Long, String) -> Unit> { requestToken, pageUrl ->
+        if (requestToken != 0L && requestToken == webViewLoadToken(catalogWebView) &&
+            catalogLoadUrl.isNotEmpty() && sameUrl(pageUrl, catalogLoadUrl)) {
             catalogLoadUrl = ""
             catalogComplete = false
             catalogErrorMessage = "目录暂时无法读取，请点击重试"
@@ -976,7 +986,7 @@ private fun JingduApp(initialUrl: String = "") {
     LaunchedEffect(activeWebView, activeLoadUrl) {
         val target = activeLoadUrl
         val view = activeWebView
-        if (view != null && target.isNotEmpty() && !sameUrl(view.url.orEmpty(), target)) {
+        if (view != null && target.isNotEmpty()) {
             view.stopLoading()
             startWebViewLoad(view, target)
         }
@@ -986,7 +996,7 @@ private fun JingduApp(initialUrl: String = "") {
         val view = prefetchWebView
         if (view != null && target.isNotEmpty()) {
             view.stopLoading()
-            if (!sameUrl(view.url.orEmpty(), target)) startWebViewLoad(view, target)
+            startWebViewLoad(view, target)
         }
     }
     LaunchedEffect(previousWebView, previousLoadUrl) {
@@ -994,7 +1004,7 @@ private fun JingduApp(initialUrl: String = "") {
         val view = previousWebView
         if (view != null && target.isNotEmpty()) {
             view.stopLoading()
-            if (!sameUrl(view.url.orEmpty(), target)) startWebViewLoad(view, target)
+            startWebViewLoad(view, target)
         }
     }
     LaunchedEffect(catalogWebView, catalogLoadUrl) {
@@ -1002,7 +1012,7 @@ private fun JingduApp(initialUrl: String = "") {
         val view = catalogWebView
         if (view != null && target.isNotEmpty()) {
             view.stopLoading()
-            if (!sameUrl(view.url.orEmpty(), target)) startWebViewLoad(view, target)
+            startWebViewLoad(view, target)
         }
     }
 
@@ -1014,7 +1024,7 @@ private fun JingduApp(initialUrl: String = "") {
                     createReaderWebView(
                         context = viewContext,
                         onPayload = { requestToken, pageUrl, rawPayload -> activePayloadState.value(requestToken, pageUrl, rawPayload) },
-                        onError = { pageUrl -> activeErrorState.value(pageUrl) }
+                        onError = { requestToken, pageUrl -> activeErrorState.value(requestToken, pageUrl) }
                     ).also { activeWebView = it }
                 },
                 update = { activeWebView = it }
@@ -1025,7 +1035,7 @@ private fun JingduApp(initialUrl: String = "") {
                     createReaderWebView(
                         context = viewContext,
                         onPayload = { requestToken, pageUrl, rawPayload -> prefetchPayloadState.value(requestToken, pageUrl, rawPayload) },
-                        onError = { pageUrl -> prefetchErrorState.value(pageUrl) }
+                        onError = { requestToken, pageUrl -> prefetchErrorState.value(requestToken, pageUrl) }
                     ).also { prefetchWebView = it }
                 },
                 update = { prefetchWebView = it }
@@ -1036,7 +1046,7 @@ private fun JingduApp(initialUrl: String = "") {
                     createReaderWebView(
                         context = viewContext,
                         onPayload = { requestToken, pageUrl, rawPayload -> previousPayloadState.value(requestToken, pageUrl, rawPayload) },
-                        onError = { pageUrl -> previousErrorState.value(pageUrl) }
+                        onError = { requestToken, pageUrl -> previousErrorState.value(requestToken, pageUrl) }
                     ).also { previousWebView = it }
                 },
                 update = { previousWebView = it }
@@ -1047,7 +1057,7 @@ private fun JingduApp(initialUrl: String = "") {
                     createReaderWebView(
                         context = viewContext,
                         onPayload = { requestToken, pageUrl, rawPayload -> catalogPayloadState.value(requestToken, pageUrl, rawPayload) },
-                        onError = { pageUrl -> catalogErrorState.value(pageUrl) }
+                        onError = { requestToken, pageUrl -> catalogErrorState.value(requestToken, pageUrl) }
                     ).also { catalogWebView = it }
                 },
                 update = { catalogWebView = it }
@@ -1241,7 +1251,7 @@ private fun startWebViewLoad(view: WebView, target: String) {
 private fun createReaderWebView(
     context: android.content.Context,
     onPayload: (Long, String, String) -> Boolean,
-    onError: (String) -> Unit
+    onError: (Long, String) -> Unit
 ): WebView {
     return WebView(context).apply {
         var nativeFallbackToken = 0L
@@ -1258,7 +1268,7 @@ private fun createReaderWebView(
                 nativeFallbackCount = 0
             }
             if (nativeFallbackCount >= 2) {
-                onError(url)
+                onError(requestToken, url)
                 return
             }
             nativeFallbackCount += 1
@@ -1273,7 +1283,7 @@ private fun createReaderWebView(
                         view.tag = requestToken + 1L
                         view.loadDataWithBaseURL(url, html, "text/html", "UTF-8", url)
                     } else {
-                        onError(url)
+                        onError(requestToken, url)
                     }
                 }
             }
@@ -2313,6 +2323,7 @@ private fun VerticalChapterView(
     val totalItemCount = nextChapter?.let { nextStartIndex + it.paragraphs.size + 1 } ?: (currentEndIndex + 1)
     var knownPreviousItemCount by remember(document.sourceUrl) { mutableStateOf(previousItemCount) }
     var suppressBoundaryNavigation by remember(document.sourceUrl) { mutableStateOf(false) }
+    val boundaryCooldownUntil = remember { mutableStateOf(0L) }
 
     LaunchedEffect(document.sourceUrl, previousChapter?.sourceUrl, previousItemCount) {
         val delta = previousItemCount - knownPreviousItemCount
@@ -2321,7 +2332,7 @@ private fun VerticalChapterView(
             try {
                 val anchoredIndex = (listState.firstVisibleItemIndex + delta).coerceIn(0, max(0, totalItemCount - 1))
                 listState.scrollToItem(anchoredIndex, listState.firstVisibleItemScrollOffset)
-                delay(50)
+                delay(250)
             } finally {
                 suppressBoundaryNavigation = false
             }
@@ -2413,8 +2424,7 @@ private fun VerticalChapterView(
         currentEndIndex,
         nextStartIndex
     ) {
-        var wasScrolling = false
-        var boundaryNavigationRequested: String? = null
+        var lastHandledIndex = -1
         snapshotFlow {
             VerticalViewport(
                 scrolling = listState.isScrollInProgress,
@@ -2427,25 +2437,23 @@ private fun VerticalChapterView(
         }
             .distinctUntilChanged()
             .collectLatest { viewport ->
-                if (suppressBoundaryNavigation) {
-                    wasScrolling = false
+                if (!positionRestored || suppressBoundaryNavigation ||
+                    System.currentTimeMillis() < boundaryCooldownUntil.value
+                ) {
                     return@collectLatest
                 }
-                if (viewport.scrolling) {
-                    wasScrolling = true
-                    return@collectLatest
-                }
-                if (!wasScrolling) return@collectLatest
-                wasScrolling = false
-
                 val firstVisible = viewport.firstVisible
+                if (firstVisible < 0 || viewport.scrolling) return@collectLatest
+                val settled = firstVisible != lastHandledIndex
+                if (!settled) return@collectLatest
                 val inPreviousChapter = previousChapter != null && firstVisible in 0 until currentStartIndex
                 val inNextChapter = nextChapter != null && firstVisible >= nextStartIndex
                 val atPreviousEdge = previousChapter == null && !viewport.canScrollBackward && document.navigation.previous != null
                 val atNextEdge = nextChapter == null && !viewport.canScrollForward && document.navigation.next != null
                 when {
-                    inPreviousChapter && boundaryNavigationRequested != "previous" -> {
-                        boundaryNavigationRequested = "previous"
+                    inPreviousChapter -> {
+                        lastHandledIndex = firstVisible
+                        boundaryCooldownUntil.value = System.currentTimeMillis() + 800L
                         document.navigation.previous?.let {
                             onContinueToChapter(
                                 it.href,
@@ -2454,8 +2462,9 @@ private fun VerticalChapterView(
                             )
                         }
                     }
-                    inNextChapter && boundaryNavigationRequested != "next" -> {
-                        boundaryNavigationRequested = "next"
+                    inNextChapter -> {
+                        lastHandledIndex = firstVisible
+                        boundaryCooldownUntil.value = System.currentTimeMillis() + 800L
                         document.navigation.next?.let {
                             onContinueToChapter(
                                 it.href,
@@ -2464,16 +2473,15 @@ private fun VerticalChapterView(
                             )
                         }
                     }
-                    atPreviousEdge && boundaryNavigationRequested != "previous" -> {
-                        boundaryNavigationRequested = "previous"
+                    atPreviousEdge -> {
+                        lastHandledIndex = firstVisible
+                        boundaryCooldownUntil.value = System.currentTimeMillis() + 800L
                         document.navigation.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.END) }
                     }
-                    atNextEdge && boundaryNavigationRequested != "next" -> {
-                        boundaryNavigationRequested = "next"
+                    atNextEdge -> {
+                        lastHandledIndex = firstVisible
+                        boundaryCooldownUntil.value = System.currentTimeMillis() + 800L
                         onAutoNext()
-                    }
-                    !inPreviousChapter && !inNextChapter && !atPreviousEdge && !atNextEdge -> {
-                        boundaryNavigationRequested = null
                     }
                 }
             }
