@@ -398,6 +398,21 @@ private fun JingduApp(initialUrl: String = "") {
         saveShelfBooks(preferences, shelfBooks)
     }
 
+    fun updateShelfTitleFromCatalog(catalogUrl: String, catalog: ReaderDocument) {
+        if (!catalog.isCatalog) return
+        val current = document?.takeUnless { it.isCatalog } ?: return
+        val key = shelfKeyForDocument(current)
+        val existing = shelfBooks.firstOrNull {
+            it.key == key || (it.catalogUrl.isNotBlank() && sameUrl(it.catalogUrl, catalogUrl))
+        } ?: return
+        val updated = existing.copy(
+            title = bookTitleForDocument(current, catalog),
+            updatedAt = System.currentTimeMillis()
+        )
+        shelfBooks = listOf(updated) + shelfBooks.filterNot { it.key == existing.key }
+        saveShelfBooks(preferences, shelfBooks)
+    }
+
     fun saveCurrentDocumentCache() {
         document?.takeUnless { it.isCatalog }?.let { saveCachedReaderDocument(preferences, it) }
     }
@@ -424,6 +439,9 @@ private fun JingduApp(initialUrl: String = "") {
         )
         shelfBooks = listOf(updated) + shelfBooks.filterNot { it.key == key }
         saveShelfBooks(preferences, shelfBooks)
+        if (catalog == null && catalogUrl.isNotBlank()) {
+            catalogLoadUrl = catalogUrl
+        }
     }
 
     fun showDocument(
@@ -811,6 +829,7 @@ private fun JingduApp(initialUrl: String = "") {
             (sameUrl(pageUrl, expected) || (result != null && sameUrl(result.sourceUrl, expected)))
         if (matches && result != null) {
             cacheDocument(result, expected)
+            updateShelfTitleFromCatalog(expected, result)
             catalogLoadUrl = ""
             true
         } else {
