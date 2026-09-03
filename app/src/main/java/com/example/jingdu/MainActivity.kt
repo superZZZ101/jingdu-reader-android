@@ -264,8 +264,32 @@ private fun JingduApp(initialUrl: String = "") {
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var settings by remember { mutableStateOf(loadSettings(preferences)) }
     var availableUpdate by remember { mutableStateOf<AppUpdateInfo?>(null) }
+    var updateChecking by remember { mutableStateOf(false) }
+    var updateStatusMessage by remember { mutableStateOf<String?>(null) }
+    val updateScope = androidx.compose.runtime.rememberCoroutineScope()
+
+    fun requestUpdateCheck() {
+        if (updateChecking) return
+        updateChecking = true
+        updateStatusMessage = null
+        availableUpdate = null
+        updateScope.launch {
+            val result = checkForAppUpdate(BuildConfig.VERSION_NAME)
+            availableUpdate = result.update
+            updateStatusMessage = when {
+                result.update != null -> null
+                result.succeeded -> "当前已是最新版本"
+                else -> "检查更新失败，请稍后重试"
+            }
+            updateChecking = false
+        }
+    }
+
     LaunchedEffect(Unit) {
-        availableUpdate = checkForAppUpdate(BuildConfig.VERSION_NAME)
+        updateChecking = true
+        val result = checkForAppUpdate(BuildConfig.VERSION_NAME)
+        availableUpdate = result.update
+        updateChecking = false
     }
     LaunchedEffect(settings.screenOrientation) {
         activity?.requestedOrientation = settings.screenOrientation.toRequestedOrientation()
@@ -942,7 +966,10 @@ private fun JingduApp(initialUrl: String = "") {
                     recentUrl = preferences.getString("last_url", null),
                     shelfCount = shelfBooks.size,
                     onOpenBookshelf = { screen = AppScreen.BOOKSHELF.name },
-                    onOpenRecent = { openUrl(it) }
+                    onOpenRecent = { openUrl(it) },
+                    onCheckForUpdate = { requestUpdateCheck() },
+                    updateChecking = updateChecking,
+                    updateStatusMessage = updateStatusMessage
                 )
             } else if (screen == AppScreen.BOOKSHELF.name) {
                 BackHandler { screen = AppScreen.HOME.name }
@@ -1236,7 +1263,10 @@ private fun HomeScreen(
     recentUrl: String?,
     shelfCount: Int,
     onOpenBookshelf: () -> Unit,
-    onOpenRecent: (String) -> Unit
+    onOpenRecent: (String) -> Unit,
+    onCheckForUpdate: () -> Unit,
+    updateChecking: Boolean,
+    updateStatusMessage: String?
 ) {
     Column(
         modifier = Modifier
@@ -1294,6 +1324,21 @@ private fun HomeScreen(
             Icon(Icons.Default.ArrowForward, contentDescription = null)
             Spacer(Modifier.width(8.dp))
             Text("打开并整理", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+        }
+        Spacer(Modifier.height(10.dp))
+        OutlinedButton(
+            onClick = onCheckForUpdate,
+            enabled = !updateChecking,
+            modifier = Modifier.fillMaxWidth().height(46.dp),
+            shape = RoundedCornerShape(9.dp)
+        ) {
+            Icon(Icons.Default.Refresh, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text(if (updateChecking) "检查中..." else "检查更新", fontSize = 14.sp)
+        }
+        updateStatusMessage?.let { message ->
+            Spacer(Modifier.height(7.dp))
+            Text(message, fontSize = 11.sp, color = IvoryPalette.muted)
         }
         if (!recentUrl.isNullOrBlank()) {
             Spacer(Modifier.height(28.dp))

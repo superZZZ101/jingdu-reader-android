@@ -14,12 +14,19 @@ data class AppUpdateInfo(
     val notes: String
 )
 
+data class AppUpdateCheckResult(
+    val update: AppUpdateInfo?,
+    val succeeded: Boolean
+)
+
 private const val UPDATE_REPOSITORY_OWNER = "superZZZ101"
 private const val UPDATE_REPOSITORY_NAME = "jingdu-reader-android"
 private const val UPDATE_ASSET_NAME = "app-release.apk"
 
-suspend fun checkForAppUpdate(currentVersionName: String): AppUpdateInfo? = withContext(Dispatchers.IO) {
-    if (UPDATE_REPOSITORY_OWNER == "YOUR_GITHUB_USERNAME") return@withContext null
+suspend fun checkForAppUpdate(currentVersionName: String): AppUpdateCheckResult = withContext(Dispatchers.IO) {
+    if (UPDATE_REPOSITORY_OWNER == "YOUR_GITHUB_USERNAME") {
+        return@withContext AppUpdateCheckResult(update = null, succeeded = true)
+    }
 
     val endpoint = "https://api.github.com/repos/" +
         "$UPDATE_REPOSITORY_OWNER/$UPDATE_REPOSITORY_NAME/releases/latest"
@@ -33,28 +40,37 @@ suspend fun checkForAppUpdate(currentVersionName: String): AppUpdateInfo? = with
     }
 
     try {
-        if (connection.responseCode !in 200..299) return@withContext null
+        if (connection.responseCode !in 200..299) {
+            return@withContext AppUpdateCheckResult(update = null, succeeded = false)
+        }
         val payload = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
         val release = JSONObject(payload)
-        if (release.optBoolean("draft") || release.optBoolean("prerelease")) return@withContext null
+        if (release.optBoolean("draft") || release.optBoolean("prerelease")) {
+            return@withContext AppUpdateCheckResult(update = null, succeeded = true)
+        }
 
         val tagVersion = release.optString("tag_name")
             .trim()
             .removePrefix("v")
             .removePrefix("V")
-        if (compareVersions(tagVersion, currentVersionName) <= 0) return@withContext null
+        if (compareVersions(tagVersion, currentVersionName) <= 0) {
+            return@withContext AppUpdateCheckResult(update = null, succeeded = true)
+        }
 
         val releaseUrl = release.optString("html_url").ifBlank { endpoint }
         val downloadUrl = findApkDownloadUrl(release)
         val releaseName = release.optString("name").trim().ifBlank { "v$tagVersion" }
-        AppUpdateInfo(
-            versionName = releaseName,
-            releaseUrl = releaseUrl,
-            downloadUrl = downloadUrl,
-            notes = release.optString("body").trim().take(1_500)
+        AppUpdateCheckResult(
+            update = AppUpdateInfo(
+                versionName = releaseName,
+                releaseUrl = releaseUrl,
+                downloadUrl = downloadUrl,
+                notes = release.optString("body").trim().take(1_500)
+            ),
+            succeeded = true
         )
     } catch (_: Exception) {
-        null
+        AppUpdateCheckResult(update = null, succeeded = false)
     } finally {
         connection.disconnect()
     }
