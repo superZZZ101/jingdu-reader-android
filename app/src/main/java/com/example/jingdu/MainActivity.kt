@@ -1,7 +1,6 @@
 package com.example.jingdu
 
 import android.annotation.SuppressLint
-import android.app.Activity
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.net.Uri
@@ -69,6 +68,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
@@ -98,6 +98,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.CoroutineScope
@@ -236,7 +238,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun JingduApp(initialUrl: String = "") {
     val context = androidx.compose.ui.platform.LocalContext.current
-    val activity = context as? Activity
+    val activity = context as? ComponentActivity
     val preferences = remember { context.getSharedPreferences("jingdu", 0) }
     var screen by rememberSaveable { mutableStateOf(AppScreen.HOME.name) }
     var address by rememberSaveable { mutableStateOf(initialUrl) }
@@ -245,6 +247,18 @@ private fun JingduApp(initialUrl: String = "") {
         if (initialUrl.isNotBlank()) address = initialUrl
     }
     var document by remember { mutableStateOf<ReaderDocument?>(null) }
+    DisposableEffect(activity, document) {
+        val lifecycle = activity?.lifecycle
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) {
+                document?.takeUnless { it.isCatalog }?.let {
+                    saveCachedReaderDocument(preferences, it, commit = true)
+                }
+            }
+        }
+        lifecycle?.addObserver(observer)
+        onDispose { lifecycle?.removeObserver(observer) }
+    }
     var previousDocument by remember { mutableStateOf<ReaderDocument?>(null) }
     var loading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
@@ -413,8 +427,8 @@ private fun JingduApp(initialUrl: String = "") {
         saveShelfBooks(preferences, shelfBooks)
     }
 
-    fun saveCurrentDocumentCache() {
-        document?.takeUnless { it.isCatalog }?.let { saveCachedReaderDocument(preferences, it) }
+    fun saveCurrentDocumentCache(commit: Boolean = false) {
+        document?.takeUnless { it.isCatalog }?.let { saveCachedReaderDocument(preferences, it, commit = commit) }
     }
 
     fun savedReadingOffset(url: String): Int? = preferences
@@ -968,7 +982,7 @@ private fun JingduApp(initialUrl: String = "") {
                     shelfBooks.any { book -> book.key == shelfKeyForDocument(current) }
                 } == true
                 BackHandler {
-                    saveCurrentDocumentCache()
+                    saveCurrentDocumentCache(commit = true)
                     screen = if (currentBookInShelf) AppScreen.BOOKSHELF.name else AppScreen.HOME.name
                     loading = false
                 }
