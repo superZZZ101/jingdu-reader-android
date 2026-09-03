@@ -1,6 +1,7 @@
 package com.example.jingdu
 
 import android.content.SharedPreferences
+import android.net.Uri
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
@@ -36,19 +37,62 @@ data class ReaderDocument(
         }
 }
 
+fun readerUrlKey(raw: String): String {
+    val value = raw.trim()
+    if (value.isEmpty()) return ""
+    val candidate = if (value.startsWith("http://", ignoreCase = true) ||
+        value.startsWith("https://", ignoreCase = true)
+    ) {
+        value
+    } else {
+        "https://$value"
+    }
+    val uri = runCatching { Uri.parse(candidate) }.getOrNull() ?: return ""
+    val scheme = uri.scheme?.lowercase().orEmpty()
+    val host = uri.host?.lowercase()?.trimEnd('.').orEmpty()
+    if (scheme != "http" && scheme != "https" || host.isEmpty()) return ""
+    val port = uri.port.takeIf {
+        it >= 0 && !(scheme == "http" && it == 80) && !(scheme == "https" && it == 443)
+    }?.let { ":$it" }.orEmpty()
+    val path = uri.encodedPath.orEmpty().ifEmpty { "/" }.trimEnd('/').ifEmpty { "/" }
+    val query = uri.encodedQuery?.let { "?$it" }.orEmpty()
+    return "$scheme://$host$port$path$query"
+}
+
+private fun resolveCatalogLink(href: String, baseUrl: String): String {
+    val value = href.trim()
+    if (value.startsWith("http://", ignoreCase = true) ||
+        value.startsWith("https://", ignoreCase = true)
+    ) {
+        return value
+    }
+    return runCatching { java.net.URI(baseUrl).resolve(value).toString() }.getOrNull() ?: value
+}
+
+private fun catalogLinkKey(href: String, baseUrl: String): String {
+    val value = href.trim()
+    val resolved = resolveCatalogLink(value, baseUrl)
+    return readerUrlKey(resolved).ifEmpty {
+        value.substringBefore('#').trimEnd('/').ifEmpty { value }
+    }
+}
+
 fun mergeCatalogDocuments(base: ReaderDocument, page: ReaderDocument): ReaderDocument {
     val items = LinkedHashMap<String, ReaderLink>()
     val pages = LinkedHashMap<String, ReaderLink>()
-    fun addLinks(target: LinkedHashMap<String, ReaderLink>, links: List<ReaderLink>) {
+    fun addLinks(target: LinkedHashMap<String, ReaderLink>, links: List<ReaderLink>, baseUrl: String) {
         links.forEach { link ->
-            val key = link.href.trim().substringBefore('#').trimEnd('/').ifEmpty { link.href.trim() }
-            if (!target.containsKey(key)) target[key] = link
+            val resolvedHref = resolveCatalogLink(link.href, baseUrl)
+            val key = catalogLinkKey(resolvedHref, baseUrl)
+            if (!target.containsKey(key)) {
+                target[key] = if (readerUrlKey(resolvedHref).isNotEmpty()) link.copy(href = resolvedHref) else link
+            }
         }
     }
-    addLinks(items, base.catalogItems)
-    addLinks(items, page.catalogItems)
-    addLinks(pages, base.catalogPages)
-    addLinks(pages, page.catalogPages)
+    addLinks(items, base.catalogItems, base.sourceUrl)
+    addLinks(items, page.catalogItems, page.sourceUrl)
+    addLinks(pages, base.catalogPages, base.sourceUrl)
+    addLinks(pages, page.catalogPages, page.sourceUrl)
     return base.copy(
         catalogItems = items.values.toList(),
         catalogPages = pages.values.toList(),
@@ -134,10 +178,16 @@ private fun isReaderNoiseParagraph(raw: String): Boolean {
         Regex("^(上一章|下一章|上一页|下一页|上页|下页|前页|后页|书页/?目录|目录|章节目录|加入书签|收藏本书|投推荐票|章节报错).{0,280}$")
     ) || (normalized.startsWith("上一章") || normalized.startsWith("下一章")) && normalized.length < 280 ||
         normalized.contains("阅读体验极差") ||
-        normalized.contains("正在进行安全验证") ||
+        normalized.contains("安全验证") ||
         normalized.contains("安全服务防护恶意自动程序") ||
         normalized.contains("验证您不是自动程序") ||
         normalized.contains("请开启浏览器无痕模式后重试") ||
+        normalized.contains("验证您是人类") ||
+        normalized.contains("checking your browser", ignoreCase = true) ||
+        normalized.contains("just a moment", ignoreCase = true) ||
+        normalized.contains("verify you are human", ignoreCase = true) ||
+        normalized.contains("banned you temporarily", ignoreCase = true) ||
+        normalized.contains("access denied", ignoreCase = true) ||
         normalized.startsWith("如果被") && normalized.contains("阅读模式") ||
         normalized.matches(Regex("^(网页无法打开|无法加载此网页|无法连接到该网站|This site can.?t be reached|ERR_[A-Z_]+).*$", RegexOption.IGNORE_CASE))
 }
@@ -153,6 +203,7 @@ data class ShelfBook(
 
 private const val SHELF_BOOKS_KEY = "shelf_books"
 private const val READER_DOCUMENT_CACHE_KEY = "reader_current_document_cache"
+private const val CATALOG_DOCUMENT_CACHE_KEY = "catalog_aggregate_document_cache"
 
 private fun ReaderLink.toJson(): JSONObject = JSONObject().apply {
     put("label", label)
@@ -202,21 +253,50 @@ private fun JSONObject.toCachedReaderDocument(): ReaderDocument? {
     )
 }
 
-fun loadCachedReaderDocument(preferences: SharedPreferences): ReaderDocument? {
-    val raw = preferences.getString(READER_DOCUMENT_CACHE_KEY, null).orEmpty()
+private fun loadCachedDocument(
+    preferences: SharedPreferences,
+    key: String
+): ReaderDocument? {
+    val raw = preferences.getString(key, null).orEmpty()
     if (raw.isBlank()) return null
     return runCatching { JSONObject(raw).toCachedReaderDocument() }.getOrNull()
 }
+
+fun loadCachedReaderDocument(preferences: SharedPreferences): ReaderDocument? =
+    loadCachedDocument(preferences, READER_DOCUMENT_CACHE_KEY)
+
+fun loadCachedCatalogDocument(preferences: SharedPreferences): ReaderDocument? =
+    loadCachedDocument(preferences, CATALOG_DOCUMENT_CACHE_KEY)?.takeIf { it.isCatalog }
 
 fun saveCachedReaderDocument(
     preferences: SharedPreferences,
     document: ReaderDocument,
     commit: Boolean = false
 ) {
-    if (document.sourceUrl.isBlank() || document.isCatalog || document.paragraphs.isEmpty()) return
+    if (document.sourceUrl.isBlank() || (!document.isCatalog && document.paragraphs.isEmpty())) return
     val editor = preferences.edit().putString(READER_DOCUMENT_CACHE_KEY, document.toCacheJson().toString())
     if (commit) editor.commit() else editor.apply()
 }
+
+fun saveCachedCatalogDocument(
+    preferences: SharedPreferences,
+    document: ReaderDocument,
+    commit: Boolean = false
+) {
+    if (!document.isCatalog || document.sourceUrl.isBlank()) return
+    val editor = preferences.edit().putString(CATALOG_DOCUMENT_CACHE_KEY, document.toCacheJson().toString())
+    if (commit) editor.commit() else editor.apply()
+}
+
+fun clearCachedCatalogDocument(preferences: SharedPreferences, rootUrl: String? = null) {
+    val cached = loadCachedCatalogDocument(preferences)
+    if (rootUrl == null || cached == null || sameReaderUrl(cached.sourceUrl, rootUrl)) {
+        preferences.edit().remove(CATALOG_DOCUMENT_CACHE_KEY).apply()
+    }
+}
+
+private fun sameReaderUrl(left: String, right: String): Boolean =
+    readerUrlKey(left).isNotEmpty() && readerUrlKey(left) == readerUrlKey(right)
 
 fun loadShelfBooks(preferences: SharedPreferences): List<ShelfBook> {
     val raw = preferences.getString(SHELF_BOOKS_KEY, null).orEmpty()

@@ -117,6 +117,13 @@ private enum class ScreenOrientation { PORTRAIT, LANDSCAPE, SYSTEM }
 private enum class ReaderPanel { NONE, SETTINGS, CATALOG }
 private enum class ChapterOpenPosition { START, END }
 
+private const val CATALOG_STATE_ROOT_KEY = "catalog_state_root"
+private const val CATALOG_STATE_LOADED_KEY = "catalog_state_loaded"
+private const val CATALOG_STATE_COUNT_KEY = "catalog_state_count"
+private const val CATALOG_STATE_COMPLETE_KEY = "catalog_state_complete"
+private const val CATALOG_STATE_LOAD_URL_KEY = "catalog_state_load_url"
+private const val CATALOG_STATE_ERROR_KEY = "catalog_state_error"
+
 private fun ReaderDocument.isUsableForReading(): Boolean =
     (isCatalog && catalogItems.isNotEmpty()) || (!isCatalog && paragraphs.isNotEmpty())
 
@@ -239,18 +246,28 @@ private fun JingduApp(initialUrl: String = "") {
     val context = androidx.compose.ui.platform.LocalContext.current
     val activity = context as? ComponentActivity
     val preferences = remember { context.getSharedPreferences("jingdu", 0) }
-    var screen by rememberSaveable { mutableStateOf(AppScreen.HOME.name) }
-    var address by rememberSaveable { mutableStateOf(initialUrl) }
-    var currentUrl by rememberSaveable { mutableStateOf("") }
+    val restoredDocument = remember { loadCachedReaderDocument(preferences) }
+    val restoredCatalogDocument = remember { loadCachedCatalogDocument(preferences) }
+    var screen by rememberSaveable {
+        mutableStateOf(
+            if (initialUrl.isBlank() && restoredDocument != null) AppScreen.READER.name else AppScreen.HOME.name
+        )
+    }
+    var address by rememberSaveable {
+        mutableStateOf(initialUrl.ifBlank { restoredDocument?.sourceUrl.orEmpty() })
+    }
+    var currentUrl by rememberSaveable {
+        mutableStateOf(restoredDocument?.sourceUrl.orEmpty())
+    }
     LaunchedEffect(initialUrl) {
         if (initialUrl.isNotBlank()) address = initialUrl
     }
-    var document by remember { mutableStateOf<ReaderDocument?>(null) }
+    var document by remember { mutableStateOf(restoredDocument) }
     DisposableEffect(activity, document) {
         val lifecycle = activity?.lifecycle
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_STOP) {
-                document?.takeUnless { it.isCatalog }?.let {
+                document?.let {
                     saveCachedReaderDocument(preferences, it, commit = true)
                 }
             }
@@ -297,16 +314,55 @@ private fun JingduApp(initialUrl: String = "") {
     var prefetchWebView by remember { mutableStateOf<WebView?>(null) }
     var previousWebView by remember { mutableStateOf<WebView?>(null) }
     var catalogWebView by remember { mutableStateOf<WebView?>(null) }
+    var activeWebViewGeneration by remember { mutableStateOf(0) }
+    var prefetchWebViewGeneration by remember { mutableStateOf(0) }
+    var previousWebViewGeneration by remember { mutableStateOf(0) }
+    var catalogWebViewGeneration by remember { mutableStateOf(0) }
     var activeLoadUrl by rememberSaveable { mutableStateOf("") }
     var prefetchLoadUrl by remember { mutableStateOf("") }
     var previousLoadUrl by remember { mutableStateOf("") }
-    var catalogLoadUrl by remember { mutableStateOf("") }
-    var catalogAggregateUrl by remember { mutableStateOf("") }
-    var catalogLoadedUrls by remember { mutableStateOf<Set<String>>(emptySet()) }
-    var catalogLoadedPageCount by remember { mutableStateOf(0) }
-    var catalogComplete by remember { mutableStateOf(false) }
-    var catalogErrorMessage by remember { mutableStateOf<String?>(null) }
-    var activeCatalogUrl by remember { mutableStateOf("") }
+    val restoredCatalogRoot = restoredCatalogDocument?.sourceUrl
+        ?: restoredDocument?.takeIf { it.isCatalog }?.sourceUrl.orEmpty()
+    val restoredCatalogLoadedUrls = remember {
+        preferences.getStringSet(CATALOG_STATE_LOADED_KEY, emptySet()).orEmpty()
+            .map { cacheKey(it) }
+            .filter { it.isNotEmpty() }
+            .toSet()
+    }
+    var catalogLoadUrl by remember {
+        mutableStateOf(preferences.getString(CATALOG_STATE_LOAD_URL_KEY, "").orEmpty())
+    }
+    var catalogAggregateUrl by remember {
+        mutableStateOf(
+            preferences.getString(CATALOG_STATE_ROOT_KEY, "").orEmpty()
+                .ifBlank { restoredCatalogRoot }
+        )
+    }
+    var catalogLoadedUrls by remember { mutableStateOf(restoredCatalogLoadedUrls) }
+    var catalogLoadedPageCount by remember {
+        mutableStateOf(
+            maxOf(
+                preferences.getInt(CATALOG_STATE_COUNT_KEY, 0),
+                restoredCatalogLoadedUrls.size
+            )
+        )
+    }
+    var catalogComplete by remember {
+        mutableStateOf(preferences.getBoolean(CATALOG_STATE_COMPLETE_KEY, false))
+    }
+    var catalogErrorMessage by remember {
+        mutableStateOf(preferences.getString(CATALOG_STATE_ERROR_KEY, null))
+    }
+    var activeCatalogUrl by remember {
+        mutableStateOf(
+            restoredCatalogDocument?.sourceUrl
+                ?: restoredDocument?.let {
+                    if (it.isCatalog) it.sourceUrl else it.navigation.catalog?.href.orEmpty()
+                }
+                .orEmpty()
+                .let(::normalizeUrl)
+        )
+    }
     var activeCatalogIndex by remember { mutableStateOf<Int?>(null) }
     var chapterOpenPosition by remember { mutableStateOf<ChapterOpenPosition?>(null) }
     var verticalOpenIndex by remember { mutableStateOf<Int?>(null) }
@@ -324,9 +380,8 @@ private fun JingduApp(initialUrl: String = "") {
     var prefetchRetryScheduled by remember { mutableStateOf(false) }
     var cachedDocuments by remember {
         mutableStateOf(
-            loadCachedReaderDocument(preferences)?.let { cached ->
-                mapOf(cacheKey(cached.sourceUrl) to cached)
-            }.orEmpty()
+            listOfNotNull(restoredDocument, restoredCatalogDocument)
+                .associateBy { cacheKey(it.sourceUrl) }
         )
     }
     var shelfBooks by remember { mutableStateOf(loadShelfBooks(preferences)) }
@@ -352,10 +407,63 @@ private fun JingduApp(initialUrl: String = "") {
         cachedDocuments = updated
     }
 
+    fun restartActiveWebView() {
+        activeWebView?.stopLoading()
+        activeWebView = null
+        activeWebViewGeneration += 1
+    }
+
+    fun restartPrefetchWebView() {
+        prefetchWebView?.stopLoading()
+        prefetchWebView = null
+        prefetchWebViewGeneration += 1
+    }
+
+    fun restartPreviousWebView() {
+        previousWebView?.stopLoading()
+        previousWebView = null
+        previousWebViewGeneration += 1
+    }
+
+    fun restartCatalogWebView() {
+        catalogWebView?.stopLoading()
+        catalogWebView = null
+        catalogWebViewGeneration += 1
+    }
+
     fun findCached(url: String): ReaderDocument? {
         val key = cacheKey(url)
         if (key.isEmpty()) return null
         return cachedDocuments[key] ?: cachedDocuments.values.firstOrNull { cacheKey(it.sourceUrl) == key }
+    }
+
+    fun invalidateCatalogCache(rawRootUrl: String) {
+        val rootUrl = normalizeUrl(rawRootUrl)
+        val rootKey = cacheKey(rootUrl)
+        if (rootKey.isEmpty()) return
+        val related = linkedSetOf(rootKey)
+        var changed = true
+        while (changed) {
+            changed = false
+            cachedDocuments.values
+                .filter { it.isCatalog }
+                .forEach { cached ->
+                    val belongsToRoot = cacheKey(cached.sourceUrl) in related ||
+                        sameUrl(cached.navigation.catalog?.href.orEmpty(), rootUrl) ||
+                        cached.catalogPages.any { cacheKey(it.href) in related }
+                    if (!belongsToRoot) return@forEach
+                    if (cacheKey(cached.sourceUrl).isNotEmpty() && related.add(cacheKey(cached.sourceUrl))) {
+                        changed = true
+                    }
+                    cached.catalogPages.forEach { page ->
+                        if (related.add(cacheKey(page.href))) changed = true
+                    }
+                }
+        }
+        cachedDocuments = cachedDocuments.filterValues {
+            !it.isCatalog || cacheKey(it.sourceUrl) !in related
+        }
+        clearCachedCatalogDocument(preferences, rootUrl)
     }
 
     fun mergeCachedContinuation(base: ReaderDocument): ReaderDocument {
@@ -382,9 +490,48 @@ private fun JingduApp(initialUrl: String = "") {
             .distinctBy { cacheKey(it.sourceUrl) }
             .filter { cacheKey(it.sourceUrl) in keep }
             .map { cacheKey(it.sourceUrl) }
+            .toMutableSet()
+
+        val catalogRoot = when {
+            current?.isCatalog == true -> current.sourceUrl
+            activeCatalogUrl.isNotEmpty() -> activeCatalogUrl
+            else -> current?.navigation?.catalog?.href.orEmpty()
+        }
+        val catalogEntries = cachedDocuments.values
+            .filter { it.isCatalog }
+            .distinctBy { cacheKey(it.sourceUrl) }
+        val activeCatalogEntries = catalogEntries.filter { cached ->
+            cacheKey(cached.sourceUrl) == cacheKey(catalogRoot) ||
+                sameUrl(cached.navigation.catalog?.href.orEmpty(), catalogRoot)
+        }
+        val catalogSourcesToKeep = linkedSetOf<String>()
+        catalogSourcesToKeep += keptSources.filter { source ->
+            catalogEntries.any { cacheKey(it.sourceUrl) == source }
+        }
+        activeCatalogEntries
+            .filter { cacheKey(it.sourceUrl) == cacheKey(catalogRoot) }
+            .forEach { catalogSourcesToKeep += cacheKey(it.sourceUrl) }
+        activeCatalogEntries
+            .asReversed()
+            .take(16)
+            .forEach { catalogSourcesToKeep += cacheKey(it.sourceUrl) }
+        catalogEntries
+            .asReversed()
+            .take(16)
+            .forEach { catalogSourcesToKeep += cacheKey(it.sourceUrl) }
+
+        val retainedNonCatalogSources = cachedDocuments.values
+            .filterNot { it.isCatalog }
+            .distinctBy { cacheKey(it.sourceUrl) }
+            .filter { cacheKey(it.sourceUrl) in keep }
+            .map { cacheKey(it.sourceUrl) }
             .toSet()
-        cachedDocuments = cachedDocuments.filterValues {
-            it.isCatalog || cacheKey(it.sourceUrl) in keptSources
+        cachedDocuments = cachedDocuments.filterValues { cached ->
+            if (cached.isCatalog) {
+                cacheKey(cached.sourceUrl) in catalogSourcesToKeep
+            } else {
+                cacheKey(cached.sourceUrl) in retainedNonCatalogSources
+            }
         }
     }
 
@@ -429,19 +576,32 @@ private fun JingduApp(initialUrl: String = "") {
             .filter { it.isNotEmpty() }
             .firstOrNull { catalogPageKey(it) !in loaded && !sameUrl(it, catalog.sourceUrl) }
 
-    fun startCatalogCrawl(rawRootUrl: String, seed: ReaderDocument? = null) {
+    fun startCatalogCrawl(
+        rawRootUrl: String,
+        seed: ReaderDocument? = null,
+        forceReload: Boolean = false
+    ) {
         val rootUrl = normalizeUrl(rawRootUrl)
         if (rootUrl.isEmpty()) return
         val sameRoot = catalogAggregateUrl.isNotEmpty() && sameUrl(catalogAggregateUrl, rootUrl)
-        if (!sameRoot) {
+        if (forceReload) {
+            invalidateCatalogCache(rootUrl)
+            restartCatalogWebView()
+        }
+        if (forceReload || !sameRoot) {
             catalogAggregateUrl = rootUrl
             catalogLoadedUrls = emptySet()
             catalogLoadedPageCount = 0
             catalogComplete = false
             catalogErrorMessage = null
+            catalogLoadUrl = ""
         }
 
-        val rootDocument = seed?.takeIf { it.isCatalog } ?: findCached(rootUrl)
+        val rootDocument = if (forceReload) {
+            null
+        } else {
+            seed?.takeIf { it.isCatalog } ?: findCached(rootUrl)
+        }
         if (rootDocument != null && rootDocument.isCatalog) {
             val cachedPageKeys = rootDocument.catalogPages
                 .map { catalogPageKey(it.href) }
@@ -458,10 +618,7 @@ private fun JingduApp(initialUrl: String = "") {
             catalogComplete = next == null
             catalogLoadUrl = next.orEmpty()
             if (next != null && sameUrl(catalogWebView?.url.orEmpty(), next)) {
-                catalogWebView?.let { view ->
-                    view.stopLoading()
-                    startWebViewLoad(view, next)
-                }
+                restartCatalogWebView()
             }
         } else {
             catalogLoadedUrls = emptySet()
@@ -470,10 +627,7 @@ private fun JingduApp(initialUrl: String = "") {
             catalogErrorMessage = null
             catalogLoadUrl = rootUrl
             if (sameUrl(catalogWebView?.url.orEmpty(), rootUrl)) {
-                catalogWebView?.let { view ->
-                    view.stopLoading()
-                    startWebViewLoad(view, rootUrl)
-                }
+                restartCatalogWebView()
             }
         }
     }
@@ -501,6 +655,8 @@ private fun JingduApp(initialUrl: String = "") {
         cacheDocument(result, expected)
         val merged = if (existing != null) mergeCatalogDocuments(existing, result) else result
         cacheDocument(merged, rootUrl)
+        saveCachedCatalogDocument(preferences, merged)
+        pruneCache(merged, previousDocument)
 
         val loadedBefore = catalogLoadedUrls
         val loadedAfter = loadedBefore + catalogPageKey(expected) + catalogPageKey(result.sourceUrl)
@@ -539,7 +695,7 @@ private fun JingduApp(initialUrl: String = "") {
     }
 
     fun saveCurrentDocumentCache(commit: Boolean = false) {
-        document?.takeUnless { it.isCatalog }?.let { saveCachedReaderDocument(preferences, it, commit = commit) }
+        document?.let { saveCachedReaderDocument(preferences, it, commit = commit) }
     }
 
     fun savedReadingOffset(url: String): Int? = preferences
@@ -589,7 +745,8 @@ private fun JingduApp(initialUrl: String = "") {
         }
         cacheDocument(displayResult, requestedUrl)
         document = displayResult
-        if (!displayResult.isCatalog) saveCachedReaderDocument(preferences, displayResult)
+        saveCachedReaderDocument(preferences, displayResult)
+        if (displayResult.isCatalog) saveCachedCatalogDocument(preferences, displayResult)
         updateShelfForDocument(displayResult)
         currentUrl = displayResult.sourceUrl
         address = displayResult.sourceUrl
@@ -637,6 +794,23 @@ private fun JingduApp(initialUrl: String = "") {
         screen = AppScreen.READER.name
         if (catalogContext != null) activeCatalogUrl = catalogContext
         activeCatalogIndex = catalogIndexOverride
+        if (forceReload) {
+            val catalogRootToRefresh = normalized.takeIf {
+                (document?.isCatalog == true && sameUrl(document?.sourceUrl.orEmpty(), normalized)) ||
+                    (activeCatalogUrl.isNotEmpty() && sameUrl(activeCatalogUrl, normalized))
+            }
+            if (catalogRootToRefresh != null) {
+                invalidateCatalogCache(catalogRootToRefresh)
+                catalogAggregateUrl = catalogRootToRefresh
+                catalogLoadedUrls = emptySet()
+                catalogLoadedPageCount = 0
+                catalogComplete = false
+                catalogErrorMessage = null
+                catalogLoadUrl = ""
+                restartCatalogWebView()
+            }
+            restartActiveWebView()
+        }
         val pendingNavigation = if (
             openPosition != null ||
             catalogContext != null ||
@@ -663,10 +837,7 @@ private fun JingduApp(initialUrl: String = "") {
             previousLoadUrl = normalized
             errorMessage = null
             loading = false
-            previousWebView?.let {
-                it.stopLoading()
-                startWebViewLoad(it, normalized)
-            }
+            restartPreviousWebView()
             return
         }
         if (cached != null && document != null && !document!!.isCatalog && !cached.isCatalog &&
@@ -798,10 +969,12 @@ private fun JingduApp(initialUrl: String = "") {
         }
     }
 
-    fun handleActiveError(requestToken: Long, pageUrl: String) {
-        if (requestToken != 0L && requestToken == webViewLoadToken(activeWebView) &&
+    fun handleActiveError(view: WebView, requestToken: Long, pageUrl: String) {
+        if (view === activeWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
             activeLoadUrl.isNotEmpty() && sameUrl(pageUrl, activeLoadUrl)) {
             val failedUrl = activeLoadUrl
+            val failedView = view
+            val failedToken = requestToken
             if (activeRetryUrl != failedUrl) {
                 activeRetryUrl = failedUrl
                 activeRetryCount = 0
@@ -813,11 +986,13 @@ private fun JingduApp(initialUrl: String = "") {
                 loading = true
                 errorMessage = null
                 val retryDelay = 700L * activeRetryCount
-                activeWebView?.postDelayed({
+                failedView.postDelayed({
                     activeRetryScheduled = false
-                    if (activeLoadUrl.isNotEmpty() && sameUrl(activeLoadUrl, failedUrl)) {
-                        activeWebView?.stopLoading()
-                        activeWebView?.let { startWebViewLoad(it, failedUrl) }
+                    if (activeWebView === failedView &&
+                        webViewLoadToken(failedView) == failedToken &&
+                        activeLoadUrl.isNotEmpty() && sameUrl(activeLoadUrl, failedUrl)
+                    ) {
+                        restartActiveWebView()
                     }
                 }, retryDelay)
             } else if (!activeRetryScheduled) {
@@ -829,11 +1004,11 @@ private fun JingduApp(initialUrl: String = "") {
         }
     }
 
-    val activePayloadState = rememberUpdatedState<(Long, String, String) -> Boolean> { requestToken, pageUrl, rawPayload ->
+    val activePayloadState = rememberUpdatedState<(WebView, Long, String, String) -> Boolean> { view, requestToken, pageUrl, rawPayload ->
         var accepted = false
         val expected = activeLoadUrl
         val result = parseReaderPayload(rawPayload)
-        val tokenMatches = requestToken != 0L && requestToken == webViewLoadToken(activeWebView)
+        val tokenMatches = view === activeWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
         val matches = expected.isNotEmpty() && tokenMatches &&
             (sameUrl(pageUrl, expected) || (result != null && sameUrl(result.sourceUrl, expected)))
         if (matches) {
@@ -855,20 +1030,18 @@ private fun JingduApp(initialUrl: String = "") {
                 }
                 pendingChapterNavigation = null
                 accepted = true
-            } else {
-                handleActiveError(requestToken, pageUrl)
             }
         }
         accepted
     }
-    val activeErrorState = rememberUpdatedState<(Long, String) -> Unit> { requestToken, pageUrl ->
-        handleActiveError(requestToken, pageUrl)
+    val activeErrorState = rememberUpdatedState<(WebView, Long, String) -> Unit> { view, requestToken, pageUrl ->
+        handleActiveError(view, requestToken, pageUrl)
     }
-    val prefetchPayloadState = rememberUpdatedState<(Long, String, String) -> Boolean> { requestToken, pageUrl, rawPayload ->
+    val prefetchPayloadState = rememberUpdatedState<(WebView, Long, String, String) -> Boolean> { view, requestToken, pageUrl, rawPayload ->
         var accepted = false
         val expected = prefetchLoadUrl
         val result = parseReaderPayload(rawPayload)
-        val tokenMatches = requestToken != 0L && requestToken == webViewLoadToken(prefetchWebView)
+        val tokenMatches = view === prefetchWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
         val matches = expected.isNotEmpty() && tokenMatches &&
             (sameUrl(pageUrl, expected) || (result != null && sameUrl(result.sourceUrl, expected)))
         if (matches && result != null && !result.isCatalog && result.paragraphs.isNotEmpty()) {
@@ -880,10 +1053,12 @@ private fun JingduApp(initialUrl: String = "") {
         }
         accepted
     }
-    val prefetchErrorState = rememberUpdatedState<(Long, String) -> Unit> { requestToken, pageUrl ->
-        if (requestToken != 0L && requestToken == webViewLoadToken(prefetchWebView) &&
+    val prefetchErrorState = rememberUpdatedState<(WebView, Long, String) -> Unit> { view, requestToken, pageUrl ->
+        if (view === prefetchWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
             prefetchLoadUrl.isNotEmpty() && sameUrl(pageUrl, prefetchLoadUrl)) {
             val failedUrl = prefetchLoadUrl
+            val failedView = view
+            val failedToken = requestToken
             if (prefetchRetryUrl != failedUrl) {
                 prefetchRetryUrl = failedUrl
                 prefetchRetryCount = 0
@@ -893,11 +1068,13 @@ private fun JingduApp(initialUrl: String = "") {
                 prefetchRetryCount += 1
                 prefetchRetryScheduled = true
                 val retryDelay = 900L * prefetchRetryCount
-                prefetchWebView?.postDelayed({
+                failedView.postDelayed({
                     prefetchRetryScheduled = false
-                    if (prefetchLoadUrl.isNotEmpty() && sameUrl(prefetchLoadUrl, failedUrl)) {
-                        prefetchWebView?.stopLoading()
-                        prefetchWebView?.let { startWebViewLoad(it, failedUrl) }
+                    if (prefetchWebView === failedView &&
+                        webViewLoadToken(failedView) == failedToken &&
+                        prefetchLoadUrl.isNotEmpty() && sameUrl(prefetchLoadUrl, failedUrl)
+                    ) {
+                        restartPrefetchWebView()
                     }
                 }, retryDelay)
             } else if (!prefetchRetryScheduled) {
@@ -909,11 +1086,11 @@ private fun JingduApp(initialUrl: String = "") {
             }
         }
     }
-    val previousPayloadState = rememberUpdatedState<(Long, String, String) -> Boolean> { requestToken, pageUrl, rawPayload ->
+    val previousPayloadState = rememberUpdatedState<(WebView, Long, String, String) -> Boolean> { view, requestToken, pageUrl, rawPayload ->
         var accepted = false
         val expected = previousLoadUrl
         val result = parseReaderPayload(rawPayload)
-        val tokenMatches = requestToken != 0L && requestToken == webViewLoadToken(previousWebView)
+        val tokenMatches = view === previousWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
         val matches = expected.isNotEmpty() && tokenMatches &&
             (sameUrl(pageUrl, expected) || (result != null && sameUrl(result.sourceUrl, expected)))
         if (matches && result != null && !result.isCatalog && result.paragraphs.isNotEmpty()) {
@@ -947,8 +1124,8 @@ private fun JingduApp(initialUrl: String = "") {
         }
         accepted
     }
-    val previousErrorState = rememberUpdatedState<(Long, String) -> Unit> { requestToken, pageUrl ->
-        if (requestToken != 0L && requestToken == webViewLoadToken(previousWebView) &&
+    val previousErrorState = rememberUpdatedState<(WebView, Long, String) -> Unit> { view, requestToken, pageUrl ->
+        if (view === previousWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
             previousLoadUrl.isNotEmpty() && sameUrl(pageUrl, previousLoadUrl)) {
             val failedUrl = previousPageBaseUrl.takeIf { it.isNotEmpty() } ?: previousLoadUrl
             previousLoadUrl = ""
@@ -956,26 +1133,21 @@ private fun JingduApp(initialUrl: String = "") {
             fallbackPendingChapterToActive(failedUrl)
         }
     }
-    val catalogPayloadState = rememberUpdatedState<(Long, String, String) -> Boolean> { requestToken, pageUrl, rawPayload ->
+    val catalogPayloadState = rememberUpdatedState<(WebView, Long, String, String) -> Boolean> { view, requestToken, pageUrl, rawPayload ->
         val expected = catalogLoadUrl
         val result = parseReaderPayload(rawPayload)
-        val tokenMatches = requestToken != 0L && requestToken == webViewLoadToken(catalogWebView)
+        val tokenMatches = view === catalogWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
         val matches = expected.isNotEmpty() && tokenMatches &&
             (sameUrl(pageUrl, expected) || (result != null && sameUrl(result.sourceUrl, expected)))
         if (matches && result?.isCatalog == true) {
             acceptCatalogPage(result, expected)
             true
-        } else if (matches) {
-            catalogLoadUrl = ""
-            catalogComplete = false
-            catalogErrorMessage = "目录暂时无法读取，请点击重试"
-            true
         } else {
             false
         }
     }
-    val catalogErrorState = rememberUpdatedState<(Long, String) -> Unit> { requestToken, pageUrl ->
-        if (requestToken != 0L && requestToken == webViewLoadToken(catalogWebView) &&
+    val catalogErrorState = rememberUpdatedState<(WebView, Long, String) -> Unit> { view, requestToken, pageUrl ->
+        if (view === catalogWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
             catalogLoadUrl.isNotEmpty() && sameUrl(pageUrl, catalogLoadUrl)) {
             catalogLoadUrl = ""
             catalogComplete = false
@@ -983,85 +1155,145 @@ private fun JingduApp(initialUrl: String = "") {
         }
     }
 
+    LaunchedEffect(
+        catalogAggregateUrl,
+        catalogLoadedUrls,
+        catalogLoadedPageCount,
+        catalogComplete,
+        catalogLoadUrl,
+        catalogErrorMessage
+    ) {
+        preferences.edit()
+            .putString(CATALOG_STATE_ROOT_KEY, catalogAggregateUrl)
+            .putStringSet(CATALOG_STATE_LOADED_KEY, catalogLoadedUrls)
+            .putInt(CATALOG_STATE_COUNT_KEY, catalogLoadedPageCount)
+            .putBoolean(CATALOG_STATE_COMPLETE_KEY, catalogComplete)
+            .putString(CATALOG_STATE_LOAD_URL_KEY, catalogLoadUrl)
+            .putString(CATALOG_STATE_ERROR_KEY, catalogErrorMessage.orEmpty())
+            .apply()
+    }
+    LaunchedEffect(screen, document, activeLoadUrl) {
+        if (screen == AppScreen.READER.name && document == null && activeLoadUrl.isBlank()) {
+            preferences.getString("last_url", null)?.let { lastUrl ->
+                if (lastUrl.isNotBlank()) openUrl(lastUrl)
+            }
+        }
+    }
     LaunchedEffect(activeWebView, activeLoadUrl) {
         val target = activeLoadUrl
         val view = activeWebView
         if (view != null && target.isNotEmpty()) {
-            view.stopLoading()
-            startWebViewLoad(view, target)
+            when {
+                webViewLoadTarget(view).isNotEmpty() && !sameUrl(webViewLoadTarget(view), target) -> {
+                    restartActiveWebView()
+                }
+                webViewLoadTarget(view).isEmpty() -> {
+                    view.stopLoading()
+                    startWebViewLoad(view, target)
+                }
+            }
         }
     }
     LaunchedEffect(prefetchWebView, prefetchLoadUrl) {
         val target = prefetchLoadUrl
         val view = prefetchWebView
         if (view != null && target.isNotEmpty()) {
-            view.stopLoading()
-            startWebViewLoad(view, target)
+            when {
+                webViewLoadTarget(view).isNotEmpty() && !sameUrl(webViewLoadTarget(view), target) -> {
+                    restartPrefetchWebView()
+                }
+                webViewLoadTarget(view).isEmpty() -> {
+                    view.stopLoading()
+                    startWebViewLoad(view, target)
+                }
+            }
         }
     }
     LaunchedEffect(previousWebView, previousLoadUrl) {
         val target = previousLoadUrl
         val view = previousWebView
         if (view != null && target.isNotEmpty()) {
-            view.stopLoading()
-            startWebViewLoad(view, target)
+            when {
+                webViewLoadTarget(view).isNotEmpty() && !sameUrl(webViewLoadTarget(view), target) -> {
+                    restartPreviousWebView()
+                }
+                webViewLoadTarget(view).isEmpty() -> {
+                    view.stopLoading()
+                    startWebViewLoad(view, target)
+                }
+            }
         }
     }
     LaunchedEffect(catalogWebView, catalogLoadUrl) {
         val target = catalogLoadUrl
         val view = catalogWebView
         if (view != null && target.isNotEmpty()) {
-            view.stopLoading()
-            startWebViewLoad(view, target)
+            when {
+                webViewLoadTarget(view).isNotEmpty() && !sameUrl(webViewLoadTarget(view), target) -> {
+                    restartCatalogWebView()
+                }
+                webViewLoadTarget(view).isEmpty() -> {
+                    view.stopLoading()
+                    startWebViewLoad(view, target)
+                }
+            }
         }
     }
 
     JingduTheme(settings.theme) {
         Box(modifier = Modifier.fillMaxSize().background(IvoryPalette.background)) {
-            AndroidView(
-                modifier = Modifier.size(1.dp).alpha(0f),
-                factory = { viewContext ->
-                    createReaderWebView(
-                        context = viewContext,
-                        onPayload = { requestToken, pageUrl, rawPayload -> activePayloadState.value(requestToken, pageUrl, rawPayload) },
-                        onError = { requestToken, pageUrl -> activeErrorState.value(requestToken, pageUrl) }
-                    ).also { activeWebView = it }
-                },
-                update = { activeWebView = it }
-            )
-            AndroidView(
-                modifier = Modifier.size(1.dp).alpha(0f),
-                factory = { viewContext ->
-                    createReaderWebView(
-                        context = viewContext,
-                        onPayload = { requestToken, pageUrl, rawPayload -> prefetchPayloadState.value(requestToken, pageUrl, rawPayload) },
-                        onError = { requestToken, pageUrl -> prefetchErrorState.value(requestToken, pageUrl) }
-                    ).also { prefetchWebView = it }
-                },
-                update = { prefetchWebView = it }
-            )
-            AndroidView(
-                modifier = Modifier.size(1.dp).alpha(0f),
-                factory = { viewContext ->
-                    createReaderWebView(
-                        context = viewContext,
-                        onPayload = { requestToken, pageUrl, rawPayload -> previousPayloadState.value(requestToken, pageUrl, rawPayload) },
-                        onError = { requestToken, pageUrl -> previousErrorState.value(requestToken, pageUrl) }
-                    ).also { previousWebView = it }
-                },
-                update = { previousWebView = it }
-            )
-            AndroidView(
-                modifier = Modifier.size(1.dp).alpha(0f),
-                factory = { viewContext ->
-                    createReaderWebView(
-                        context = viewContext,
-                        onPayload = { requestToken, pageUrl, rawPayload -> catalogPayloadState.value(requestToken, pageUrl, rawPayload) },
-                        onError = { requestToken, pageUrl -> catalogErrorState.value(requestToken, pageUrl) }
-                    ).also { catalogWebView = it }
-                },
-                update = { catalogWebView = it }
-            )
+            key(activeWebViewGeneration) {
+                AndroidView(
+                    modifier = Modifier.size(1.dp).alpha(0f),
+                    factory = { viewContext ->
+                        createReaderWebView(
+                            context = viewContext,
+                            onPayload = { view, requestToken, pageUrl, rawPayload -> activePayloadState.value(view, requestToken, pageUrl, rawPayload) },
+                            onError = { view, requestToken, pageUrl -> activeErrorState.value(view, requestToken, pageUrl) }
+                        ).also { activeWebView = it }
+                    },
+                    update = { activeWebView = it }
+                )
+            }
+            key(prefetchWebViewGeneration) {
+                AndroidView(
+                    modifier = Modifier.size(1.dp).alpha(0f),
+                    factory = { viewContext ->
+                        createReaderWebView(
+                            context = viewContext,
+                            onPayload = { view, requestToken, pageUrl, rawPayload -> prefetchPayloadState.value(view, requestToken, pageUrl, rawPayload) },
+                            onError = { view, requestToken, pageUrl -> prefetchErrorState.value(view, requestToken, pageUrl) }
+                        ).also { prefetchWebView = it }
+                    },
+                    update = { prefetchWebView = it }
+                )
+            }
+            key(previousWebViewGeneration) {
+                AndroidView(
+                    modifier = Modifier.size(1.dp).alpha(0f),
+                    factory = { viewContext ->
+                        createReaderWebView(
+                            context = viewContext,
+                            onPayload = { view, requestToken, pageUrl, rawPayload -> previousPayloadState.value(view, requestToken, pageUrl, rawPayload) },
+                            onError = { view, requestToken, pageUrl -> previousErrorState.value(view, requestToken, pageUrl) }
+                        ).also { previousWebView = it }
+                    },
+                    update = { previousWebView = it }
+                )
+            }
+            key(catalogWebViewGeneration) {
+                AndroidView(
+                    modifier = Modifier.size(1.dp).alpha(0f),
+                    factory = { viewContext ->
+                        createReaderWebView(
+                            context = viewContext,
+                            onPayload = { view, requestToken, pageUrl, rawPayload -> catalogPayloadState.value(view, requestToken, pageUrl, rawPayload) },
+                            onError = { view, requestToken, pageUrl -> catalogErrorState.value(view, requestToken, pageUrl) }
+                        ).also { catalogWebView = it }
+                    },
+                    update = { catalogWebView = it }
+                )
+            }
 
             if (screen == AppScreen.HOME.name) {
                 HomeScreen(
@@ -1164,10 +1396,10 @@ private fun JingduApp(initialUrl: String = "") {
                     },
                     onRetryCatalog = {
                         val catalogUrl = activeCatalogUrl.takeIf { it.isNotEmpty() } ?: baseCatalogUrl
-                        if (catalogUrl.isNotEmpty()) startCatalogCrawl(catalogUrl)
+                        if (catalogUrl.isNotEmpty()) startCatalogCrawl(catalogUrl, forceReload = true)
                     },
                     onClose = {
-                        document?.takeUnless { current -> current.isCatalog }?.let { current ->
+                        document?.let { current ->
                             saveCachedReaderDocument(preferences, current, commit = true)
                         }
                         screen = if (currentBookInShelf) AppScreen.BOOKSHELF.name else AppScreen.HOME.name
@@ -1239,19 +1471,37 @@ private fun fetchReaderHtml(url: String): String? {
     }
 }
 
-private fun webViewLoadToken(view: WebView?): Long = (view?.tag as? Long) ?: 0L
+private data class ReaderWebViewLoad(
+    val token: Long,
+    val target: String
+)
+
+private var readerWebViewTokenCounter = 0L
+
+private fun nextReaderWebViewToken(): Long {
+    readerWebViewTokenCounter += 1L
+    return readerWebViewTokenCounter
+}
+
+private fun webViewLoadToken(view: WebView?): Long = when (val tag = view?.tag) {
+    is ReaderWebViewLoad -> tag.token
+    is Long -> tag
+    else -> 0L
+}
+
+private fun webViewLoadTarget(view: WebView?): String =
+    (view?.tag as? ReaderWebViewLoad)?.target.orEmpty()
 
 private fun startWebViewLoad(view: WebView, target: String) {
-    val token = webViewLoadToken(view) + 1L
-    view.tag = token
+    view.tag = ReaderWebViewLoad(nextReaderWebViewToken(), target)
     view.loadUrl(target)
 }
 
 @SuppressLint("SetJavaScriptEnabled")
 private fun createReaderWebView(
     context: android.content.Context,
-    onPayload: (Long, String, String) -> Boolean,
-    onError: (Long, String) -> Unit
+    onPayload: (WebView, Long, String, String) -> Boolean,
+    onError: (WebView, Long, String) -> Unit
 ): WebView {
     return WebView(context).apply {
         var nativeFallbackToken = 0L
@@ -1259,6 +1509,13 @@ private fun createReaderWebView(
         var nativeFallbackUrl = ""
         var nativeFallbackCount = 0
         var acceptedPayloadToken = 0L
+        var reportedErrorToken = 0L
+
+        fun reportError(view: WebView, requestToken: Long, url: String) {
+            if (requestToken == 0L || reportedErrorToken == requestToken) return
+            reportedErrorToken = requestToken
+            onError(view, requestToken, url)
+        }
 
         fun tryNativeFallback(view: WebView, url: String, requestToken: Long) {
             if (requestToken == 0L || nativeFallbackToken == requestToken) return
@@ -1268,7 +1525,7 @@ private fun createReaderWebView(
                 nativeFallbackCount = 0
             }
             if (nativeFallbackCount >= 2) {
-                onError(requestToken, url)
+                reportError(view, requestToken, url)
                 return
             }
             nativeFallbackCount += 1
@@ -1280,10 +1537,10 @@ private fun createReaderWebView(
                     nativeFallbackInFlightToken = 0L
                     if (html != null) {
                         view.stopLoading()
-                        view.tag = requestToken + 1L
+                        view.tag = ReaderWebViewLoad(nextReaderWebViewToken(), url)
                         view.loadDataWithBaseURL(url, html, "text/html", "UTF-8", url)
                     } else {
-                        onError(requestToken, url)
+                        reportError(view, requestToken, url)
                     }
                 }
             }
@@ -1299,16 +1556,26 @@ private fun createReaderWebView(
         settings.allowContentAccess = false
         settings.userAgentString = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"
         webViewClient = object : WebViewClient() {
-            fun scheduleExtraction(view: WebView, url: String, requestToken: Long, delayMillis: Long) {
+            fun scheduleExtraction(
+                view: WebView,
+                url: String,
+                requestToken: Long,
+                delayMillis: Long,
+                finalAttempt: Boolean = false
+            ) {
                 view.postDelayed({
                     if (requestToken != webViewLoadToken(view)) return@postDelayed
                     if (acceptedPayloadToken == requestToken) return@postDelayed
                     val currentUrl = view.url.orEmpty()
                     if (currentUrl.isNotEmpty() && !sameUrl(currentUrl, url)) return@postDelayed
                     view.evaluateJavascript(ReaderScript.extract) { rawPayload ->
-                        if (onPayload(requestToken, url, rawPayload)) {
+                        if (onPayload(view, requestToken, url, rawPayload)) {
                             acceptedPayloadToken = requestToken
                             if (nativeFallbackInFlightToken == requestToken) nativeFallbackInFlightToken = 0L
+                        } else if (finalAttempt && requestToken == webViewLoadToken(view)) {
+                            if (nativeFallbackInFlightToken != requestToken) {
+                                tryNativeFallback(view, url, requestToken)
+                            }
                         }
                     }
                 }, delayMillis)
@@ -1318,7 +1585,7 @@ private fun createReaderWebView(
                 val requestToken = webViewLoadToken(view)
                 scheduleExtraction(view, url, requestToken, 1_200L)
                 scheduleExtraction(view, url, requestToken, 3_500L)
-                scheduleExtraction(view, url, requestToken, 8_000L)
+                scheduleExtraction(view, url, requestToken, 8_000L, finalAttempt = true)
                 view.postDelayed({
                     if (requestToken != webViewLoadToken(view)) return@postDelayed
                     if (acceptedPayloadToken == requestToken) return@postDelayed
@@ -1334,6 +1601,7 @@ private fun createReaderWebView(
                 scheduleExtraction(view, url, requestToken, 0L)
                 scheduleExtraction(view, url, requestToken, 700L)
                 scheduleExtraction(view, url, requestToken, 2_000L)
+                scheduleExtraction(view, url, requestToken, 5_000L, finalAttempt = true)
             }
 
             override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
@@ -1942,7 +2210,15 @@ private fun CatalogDrawer(
 ) {
     val currentUrl = currentDocument?.sourceUrl.orEmpty()
     val currentTitle = currentDocument?.title.orEmpty()
-    val matchedIndex = remember(catalogDocument?.sourceUrl, currentUrl, currentTitle) {
+    val catalogItemCount = catalogDocument?.catalogItems?.size ?: 0
+    val catalogLastItemKey = catalogDocument?.catalogItems?.lastOrNull()?.let { readerUrlKey(it.href) }.orEmpty()
+    val matchedIndex = remember(
+        catalogDocument?.sourceUrl,
+        catalogItemCount,
+        catalogLastItemKey,
+        currentUrl,
+        currentTitle
+    ) {
         catalogDocument?.catalogItems?.indexOfFirst { item ->
             sameUrl(item.href, currentUrl) || sameChapter(item.label, currentTitle)
         } ?: -1
@@ -1951,7 +2227,14 @@ private fun CatalogDrawer(
         catalogDocument != null && it in catalogDocument.catalogItems.indices
     } ?: matchedIndex
     val listState = rememberLazyListState()
-    LaunchedEffect(catalogDocument?.sourceUrl, currentUrl, currentTitle, currentIndex) {
+    LaunchedEffect(
+        catalogDocument?.sourceUrl,
+        catalogItemCount,
+        catalogLastItemKey,
+        currentUrl,
+        currentTitle,
+        currentIndex
+    ) {
         if (currentIndex >= 0) {
             val targetIndex = currentIndex + 1
             listState.scrollToItem(targetIndex)
@@ -2927,14 +3210,17 @@ private fun extractSharedUrl(intent: Intent?): String {
 private fun normalizeUrl(raw: String): String {
     val value = raw.trim()
     if (value.isEmpty()) return ""
-    val candidate = if (value.startsWith("http://") || value.startsWith("https://")) value else "https://$value"
+    val candidate = if (
+        value.startsWith("http://", ignoreCase = true) ||
+            value.startsWith("https://", ignoreCase = true)
+    ) value else "https://$value"
     return runCatching {
         val uri = android.net.Uri.parse(candidate)
-        if (uri.scheme == "http" || uri.scheme == "https") uri.toString() else ""
+        if (uri.scheme?.lowercase() == "http" || uri.scheme?.lowercase() == "https") uri.toString() else ""
     }.getOrDefault("")
 }
 
-private fun cacheKey(raw: String): String = normalizeUrl(raw).substringBefore('#').trimEnd('/')
+private fun cacheKey(raw: String): String = readerUrlKey(raw)
 
 private fun sameUrl(first: String, second: String): Boolean {
     val left = cacheKey(first)

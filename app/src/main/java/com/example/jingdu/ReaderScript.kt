@@ -65,6 +65,9 @@ object ReaderScript {
             if (!document.body) return [];
             const containers = [...document.querySelectorAll(CATALOG_CONTAINERS), document.body];
             const pageHint = document.title + ' ' + location.pathname + ' ' + visible(document.body.querySelector('h1,h2,h3') || document.body);
+            const pageLooksLikeChapter = CHAPTER_WORD.test(document.title) ||
+              [...document.querySelectorAll('h1,h2,h3,.chapter-title,.chapterTitle,.title')]
+                .some((heading) => CHAPTER_WORD.test(clean(heading.textContent)));
             let best = [];
             let bestScore = -1;
             for (const container of containers) {
@@ -77,7 +80,7 @@ object ReaderScript {
                 const label = labelFor(anchor);
                 return PAGE_WORD.test(label) || pageNumber(label);
               });
-              if (container === document.body && items.length < 4 && !hasPaginationHint) continue;
+              if (container === document.body && items.length < 4 && !hasPaginationHint && pageLooksLikeChapter) continue;
               if (!marked && !bodyLooksLikeCatalog && !hasPaginationHint) continue;
               const score = items.length * 12 + (marked ? 240 : 0) + (container !== document.body ? 120 : 0);
               if (score > bestScore) { bestScore = score; best = items; }
@@ -214,7 +217,7 @@ object ReaderScript {
           }
 
           const browserErrorText = clean((document.title || '') + ' ' + visible(document.body));
-          if (/ERR_[A-Z_]+|网页无法打开|无法加载此网页|无法连接到该网站|This site can.?t be reached|connection refused/i.test(browserErrorText)) {
+          if (/ERR_[A-Z_]+|网页无法打开|无法加载此网页|无法连接到该网站|This site can.?t be reached|connection refused|安全验证|checking your browser|just a moment|verify you are human|banned you temporarily|access denied/i.test(browserErrorText)) {
             return JSON.stringify({ sourceUrl: location.href, title: '网页无法打开', paragraphs: [], catalogItems: [], catalogPages: [], navigation: findNavigation() });
           }
           const candidate = findCandidate();
