@@ -492,8 +492,12 @@ private fun JingduApp(initialUrl: String = "") {
         val window = activity?.window
         if (window != null) {
             val palette = if (screen == AppScreen.READER.name) paletteFor(settings.theme) else IvoryPalette
+            val horizontalReader = screen == AppScreen.READER.name && settings.pageMode == PageMode.HORIZONTAL
             window.statusBarColor = palette.background.toArgb()
-            window.navigationBarColor = palette.background.toArgb()
+            window.navigationBarColor = if (horizontalReader) AndroidColor.TRANSPARENT else palette.background.toArgb()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                window.isNavigationBarContrastEnforced = !horizontalReader
+            }
             WindowInsetsControllerCompat(window, window.decorView).apply {
                 isAppearanceLightStatusBars = screen != AppScreen.READER.name || settings.theme != ReaderTheme.NIGHT
                 isAppearanceLightNavigationBars = screen != AppScreen.READER.name || settings.theme != ReaderTheme.NIGHT
@@ -2065,7 +2069,10 @@ private fun ReaderScreen(
         menuVisible = false
         panel = ReaderPanel.NONE.name
     }
-    Surface(modifier = Modifier.fillMaxSize(), color = palette.background) {
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = if (settings.pageMode == PageMode.HORIZONTAL) Color.Transparent else palette.background
+    ) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -2136,7 +2143,7 @@ private fun ReaderScreen(
                     palette = palette,
                     onPreviousChapter = {
                         menuVisible = false
-                        document?.navigation?.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.END) }
+                        document?.navigation?.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.START) }
                     },
                     onNextChapter = {
                         menuVisible = false
@@ -3096,6 +3103,7 @@ private fun HorizontalChapterView(
         modifier = Modifier
             .fillMaxSize()
             .safeDrawingPadding()
+            .background(palette.background)
     ) {
         val density = androidx.compose.ui.platform.LocalDensity.current
         val textMeasurer = rememberTextMeasurer()
