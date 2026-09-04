@@ -1,10 +1,13 @@
 package com.example.jingdu
 
 import android.annotation.SuppressLint
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.net.Uri
 import android.graphics.Color as AndroidColor
+import android.os.Build
 import android.os.Bundle
 import android.view.ViewGroup
 import android.webkit.WebResourceError
@@ -12,6 +15,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -51,10 +55,12 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.ArrowForward
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -107,6 +113,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.snapshotFlow
 import kotlinx.coroutines.delay
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.math.max
 import kotlin.math.min
 
@@ -124,6 +133,8 @@ private const val CATALOG_STATE_COUNT_KEY = "catalog_state_count"
 private const val CATALOG_STATE_COMPLETE_KEY = "catalog_state_complete"
 private const val CATALOG_STATE_LOAD_URL_KEY = "catalog_state_load_url"
 private const val CATALOG_STATE_ERROR_KEY = "catalog_state_error"
+private const val DIAGNOSTIC_LOG_KEY = "diagnostic_log"
+private const val MAX_DIAGNOSTIC_LOGS = 80
 
 private fun ReaderDocument.isUsableForReading(): Boolean =
     (isCatalog && catalogItems.isNotEmpty()) || (!isCatalog && paragraphs.isNotEmpty())
@@ -180,6 +191,77 @@ private data class VerticalViewport(
     val canScrollBackward: Boolean,
     val canScrollForward: Boolean
 )
+
+private fun loadDiagnosticLogs(preferences: android.content.SharedPreferences): List<String> =
+    preferences.getString(DIAGNOSTIC_LOG_KEY, "")
+        .orEmpty()
+        .lineSequence()
+        .map(String::trim)
+        .filter(String::isNotEmpty)
+        .toList()
+        .takeLast(MAX_DIAGNOSTIC_LOGS)
+
+private fun diagnosticValue(value: String): String = value
+    .replace(Regex("\\s+"), " ")
+    .trim()
+    .ifEmpty { "-" }
+    .take(320)
+
+private fun diagnosticTimestamp(): String =
+    SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
+
+private fun buildDiagnosticReport(
+    errorMessage: String?,
+    logs: List<String>,
+    currentUrl: String,
+    activeLoadUrl: String,
+    prefetchLoadUrl: String,
+    previousLoadUrl: String,
+    catalogLoadUrl: String,
+    pendingUrl: String?,
+    pageMode: PageMode
+): String = buildString {
+    appendLine("静读诊断日志")
+    appendLine("generatedAt=${diagnosticTimestamp()}")
+    appendLine("appVersion=${BuildConfig.VERSION_NAME}")
+    appendLine("androidApi=${Build.VERSION.SDK_INT}")
+    appendLine("device=${diagnosticValue("${Build.MANUFACTURER} ${Build.MODEL}")}")
+    appendLine("pageMode=${pageMode.name}")
+    appendLine("error=${diagnosticValue(errorMessage.orEmpty())}")
+    appendLine("currentUrl=${diagnosticValue(currentUrl)}")
+    appendLine("activeLoadUrl=${diagnosticValue(activeLoadUrl)}")
+    appendLine("prefetchLoadUrl=${diagnosticValue(prefetchLoadUrl)}")
+    appendLine("previousLoadUrl=${diagnosticValue(previousLoadUrl)}")
+    appendLine("catalogLoadUrl=${diagnosticValue(catalogLoadUrl)}")
+    appendLine("pendingUrl=${diagnosticValue(pendingUrl.orEmpty())}")
+    appendLine("events:")
+    if (logs.isEmpty()) {
+        appendLine("(none)")
+    } else {
+        logs.forEach(::appendLine)
+    }
+}
+
+private fun copyDiagnosticReport(context: android.content.Context, report: String) {
+    context.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(
+        ClipData.newPlainText("静读错误日志", report)
+    )
+    Toast.makeText(context, "错误日志已复制", Toast.LENGTH_SHORT).show()
+}
+
+private fun shareDiagnosticReport(context: android.content.Context, report: String) {
+    val sendIntent = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_SUBJECT, "静读错误日志")
+        putExtra(Intent.EXTRA_TEXT, report)
+    }
+    runCatching {
+        context.startActivity(Intent.createChooser(sendIntent, "发送错误日志"))
+    }.onFailure {
+        Toast.makeText(context, "没有可用的分享应用，已尝试复制日志", Toast.LENGTH_SHORT).show()
+        copyDiagnosticReport(context, report)
+    }
+}
 
 private data class ReaderSettings(
     val theme: ReaderTheme = ReaderTheme.IVORY,
@@ -279,6 +361,25 @@ private fun JingduApp(initialUrl: String = "") {
     var previousDocument by remember { mutableStateOf<ReaderDocument?>(null) }
     var loading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var diagnosticLogs by remember { mutableStateOf(loadDiagnosticLogs(preferences)) }
+    fun recordDiagnostic(stage: String, url: String = "", details: String = "") {
+        val line = buildString {
+            append(diagnosticTimestamp())
+            append(" [")
+            append(diagnosticValue(stage))
+            append("] url=")
+            append(diagnosticValue(url))
+            if (details.isNotBlank()) {
+                append(" ")
+                append(diagnosticValue(details))
+            }
+        }
+        diagnosticLogs = (diagnosticLogs + line).takeLast(MAX_DIAGNOSTIC_LOGS)
+        preferences.edit()
+            .putString(DIAGNOSTIC_LOG_KEY, diagnosticLogs.joinToString("\n"))
+            .apply()
+        android.util.Log.e("Jingdu", line)
+    }
     var settings by remember { mutableStateOf(loadSettings(preferences)) }
     var availableUpdate by remember { mutableStateOf<AppUpdateInfo?>(null) }
     var updateChecking by remember { mutableStateOf(false) }
@@ -806,6 +907,7 @@ private fun JingduApp(initialUrl: String = "") {
         val catalogContext = catalogUrlOverride?.let(::normalizeUrl)?.takeIf { it.isNotEmpty() }
         if (normalized.isEmpty()) {
             errorMessage = "请输入完整的网址，例如 https://example.com"
+            recordDiagnostic("invalid_url", raw, "normalize_failed")
             return
         }
         preferences.edit().putString("last_url", normalized).apply()
@@ -979,6 +1081,7 @@ private fun JingduApp(initialUrl: String = "") {
     fun fallbackPendingChapterToActive(expected: String) {
         val pending = pendingChapterNavigation
         if (pending != null && sameUrl(pending.url, expected)) {
+            recordDiagnostic("fallback_to_active", expected, "pending_navigation=true")
             errorMessage = null
             loading = false
             activeLoadUrl = expected
@@ -988,12 +1091,17 @@ private fun JingduApp(initialUrl: String = "") {
         }
     }
 
-    fun handleActiveError(view: WebView, requestToken: Long, pageUrl: String) {
+    fun handleActiveError(view: WebView, requestToken: Long, pageUrl: String, reason: String) {
         if (view === activeWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
             activeLoadUrl.isNotEmpty() && sameUrl(pageUrl, activeLoadUrl)) {
             val failedUrl = activeLoadUrl
             val failedView = view
             val failedToken = requestToken
+            recordDiagnostic(
+                "active_load_error",
+                failedUrl,
+                "token=$failedToken pageUrl=$pageUrl retry=$activeRetryCount reason=$reason"
+            )
             if (activeRetryUrl != failedUrl) {
                 activeRetryUrl = failedUrl
                 activeRetryCount = 0
@@ -1053,8 +1161,8 @@ private fun JingduApp(initialUrl: String = "") {
         }
         accepted
     }
-    val activeErrorState = rememberUpdatedState<(WebView, Long, String) -> Unit> { view, requestToken, pageUrl ->
-        handleActiveError(view, requestToken, pageUrl)
+    val activeErrorState = rememberUpdatedState<(WebView, Long, String, String) -> Unit> { view, requestToken, pageUrl, reason ->
+        handleActiveError(view, requestToken, pageUrl, reason)
     }
     val prefetchPayloadState = rememberUpdatedState<(WebView, Long, String, String) -> Boolean> { view, requestToken, pageUrl, rawPayload ->
         var accepted = false
@@ -1072,12 +1180,17 @@ private fun JingduApp(initialUrl: String = "") {
         }
         accepted
     }
-    val prefetchErrorState = rememberUpdatedState<(WebView, Long, String) -> Unit> { view, requestToken, pageUrl ->
+    val prefetchErrorState = rememberUpdatedState<(WebView, Long, String, String) -> Unit> { view, requestToken, pageUrl, reason ->
         if (view === prefetchWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
             prefetchLoadUrl.isNotEmpty() && sameUrl(pageUrl, prefetchLoadUrl)) {
             val failedUrl = prefetchLoadUrl
             val failedView = view
             val failedToken = requestToken
+            recordDiagnostic(
+                "prefetch_load_error",
+                failedUrl,
+                "token=$failedToken pageUrl=$pageUrl retry=$prefetchRetryCount reason=$reason"
+            )
             if (prefetchRetryUrl != failedUrl) {
                 prefetchRetryUrl = failedUrl
                 prefetchRetryCount = 0
@@ -1146,10 +1259,15 @@ private fun JingduApp(initialUrl: String = "") {
         }
         accepted
     }
-    val previousErrorState = rememberUpdatedState<(WebView, Long, String) -> Unit> { view, requestToken, pageUrl ->
+    val previousErrorState = rememberUpdatedState<(WebView, Long, String, String) -> Unit> { view, requestToken, pageUrl, reason ->
         if (view === previousWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
             previousLoadUrl.isNotEmpty() && sameUrl(pageUrl, previousLoadUrl)) {
             val failedUrl = previousPageBaseUrl.takeIf { it.isNotEmpty() } ?: previousLoadUrl
+            recordDiagnostic(
+                "previous_load_error",
+                failedUrl,
+                "token=$requestToken pageUrl=$pageUrl reason=$reason"
+            )
             previousLoadUrl = ""
             previousPageBaseUrl = ""
             fallbackPendingChapterToActive(failedUrl)
@@ -1168,9 +1286,14 @@ private fun JingduApp(initialUrl: String = "") {
             false
         }
     }
-    val catalogErrorState = rememberUpdatedState<(WebView, Long, String) -> Unit> { view, requestToken, pageUrl ->
+    val catalogErrorState = rememberUpdatedState<(WebView, Long, String, String) -> Unit> { view, requestToken, pageUrl, reason ->
         if (view === catalogWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
             catalogLoadUrl.isNotEmpty() && sameUrl(pageUrl, catalogLoadUrl)) {
+            recordDiagnostic(
+                "catalog_load_error",
+                catalogLoadUrl,
+                "token=$requestToken pageUrl=$pageUrl reason=$reason"
+            )
             catalogLoadUrl = ""
             catalogComplete = false
             catalogErrorMessage = "目录暂时无法读取，请点击重试"
@@ -1238,6 +1361,11 @@ private fun JingduApp(initialUrl: String = "") {
         if (!sameUrl(prefetchLoadUrl, target)) return@LaunchedEffect
         val pending = pendingChapterNavigation
         val waitingForTarget = pending != null && sameUrl(pending.url, target)
+        recordDiagnostic(
+            "prefetch_timeout",
+            target,
+            "pending=$waitingForTarget base=$prefetchPageBaseUrl"
+        )
         prefetchLoadUrl = ""
         prefetchPageBaseUrl = ""
         prefetchRetryUrl = ""
@@ -1270,6 +1398,11 @@ private fun JingduApp(initialUrl: String = "") {
         val fallbackTarget = pending?.url?.takeIf {
             sameUrl(it, target) || (previousPageBaseUrl.isNotEmpty() && sameUrl(it, previousPageBaseUrl))
         }
+        recordDiagnostic(
+            "previous_timeout",
+            target,
+            "pending=${pending != null} fallback=${fallbackTarget != null} base=$previousPageBaseUrl"
+        )
         previousLoadUrl = ""
         previousPageBaseUrl = ""
         restartPreviousWebView()
@@ -1291,6 +1424,18 @@ private fun JingduApp(initialUrl: String = "") {
         }
     }
 
+    val diagnosticReport = buildDiagnosticReport(
+        errorMessage = errorMessage,
+        logs = diagnosticLogs,
+        currentUrl = currentUrl,
+        activeLoadUrl = activeLoadUrl,
+        prefetchLoadUrl = prefetchLoadUrl,
+        previousLoadUrl = previousLoadUrl,
+        catalogLoadUrl = catalogLoadUrl,
+        pendingUrl = pendingChapterNavigation?.url,
+        pageMode = settings.pageMode
+    )
+
     JingduTheme(settings.theme) {
         Box(modifier = Modifier.fillMaxSize().background(IvoryPalette.background)) {
             key(activeWebViewGeneration) {
@@ -1300,7 +1445,7 @@ private fun JingduApp(initialUrl: String = "") {
                         createReaderWebView(
                             context = viewContext,
                             onPayload = { view, requestToken, pageUrl, rawPayload -> activePayloadState.value(view, requestToken, pageUrl, rawPayload) },
-                            onError = { view, requestToken, pageUrl -> activeErrorState.value(view, requestToken, pageUrl) }
+                            onError = { view, requestToken, pageUrl, reason -> activeErrorState.value(view, requestToken, pageUrl, reason) }
                         ).also { activeWebView = it }
                     },
                     update = { activeWebView = it }
@@ -1313,7 +1458,7 @@ private fun JingduApp(initialUrl: String = "") {
                         createReaderWebView(
                             context = viewContext,
                             onPayload = { view, requestToken, pageUrl, rawPayload -> prefetchPayloadState.value(view, requestToken, pageUrl, rawPayload) },
-                            onError = { view, requestToken, pageUrl -> prefetchErrorState.value(view, requestToken, pageUrl) }
+                            onError = { view, requestToken, pageUrl, reason -> prefetchErrorState.value(view, requestToken, pageUrl, reason) }
                         ).also { prefetchWebView = it }
                     },
                     update = { prefetchWebView = it }
@@ -1326,7 +1471,7 @@ private fun JingduApp(initialUrl: String = "") {
                         createReaderWebView(
                             context = viewContext,
                             onPayload = { view, requestToken, pageUrl, rawPayload -> previousPayloadState.value(view, requestToken, pageUrl, rawPayload) },
-                            onError = { view, requestToken, pageUrl -> previousErrorState.value(view, requestToken, pageUrl) }
+                            onError = { view, requestToken, pageUrl, reason -> previousErrorState.value(view, requestToken, pageUrl, reason) }
                         ).also { previousWebView = it }
                     },
                     update = { previousWebView = it }
@@ -1339,7 +1484,7 @@ private fun JingduApp(initialUrl: String = "") {
                         createReaderWebView(
                             context = viewContext,
                             onPayload = { view, requestToken, pageUrl, rawPayload -> catalogPayloadState.value(view, requestToken, pageUrl, rawPayload) },
-                            onError = { view, requestToken, pageUrl -> catalogErrorState.value(view, requestToken, pageUrl) }
+                            onError = { view, requestToken, pageUrl, reason -> catalogErrorState.value(view, requestToken, pageUrl, reason) }
                         ).also { catalogWebView = it }
                     },
                     update = { catalogWebView = it }
@@ -1403,7 +1548,10 @@ private fun JingduApp(initialUrl: String = "") {
                 }
                 ReaderScreen(
                     document = document,
-                    loading = loading,
+                    diagnosticLog = diagnosticReport,
+                     onCopyDiagnosticLog = { copyDiagnosticReport(context, diagnosticReport) },
+                     onShareDiagnosticLog = { shareDiagnosticReport(context, diagnosticReport) },
+                     loading = loading,
                     errorMessage = errorMessage,
                     settings = settings,
                     readingOffset = readingOffset,
@@ -1552,7 +1700,7 @@ private fun startWebViewLoad(view: WebView, target: String) {
 private fun createReaderWebView(
     context: android.content.Context,
     onPayload: (WebView, Long, String, String) -> Boolean,
-    onError: (WebView, Long, String) -> Unit
+    onError: (WebView, Long, String, String) -> Unit
 ): WebView {
     return WebView(context).apply {
         var nativeFallbackToken = 0L
@@ -1562,13 +1710,13 @@ private fun createReaderWebView(
         var acceptedPayloadToken = 0L
         var reportedErrorToken = 0L
 
-        fun reportError(view: WebView, requestToken: Long, url: String) {
+        fun reportError(view: WebView, requestToken: Long, url: String, reason: String) {
             if (requestToken == 0L || reportedErrorToken == requestToken) return
             reportedErrorToken = requestToken
-            onError(view, requestToken, url)
+            onError(view, requestToken, url, reason)
         }
 
-        fun tryNativeFallback(view: WebView, url: String, requestToken: Long) {
+        fun tryNativeFallback(view: WebView, url: String, requestToken: Long, reason: String) {
             if (requestToken == 0L || nativeFallbackToken == requestToken) return
             nativeFallbackToken = requestToken
             if (url != nativeFallbackUrl) {
@@ -1576,7 +1724,7 @@ private fun createReaderWebView(
                 nativeFallbackCount = 0
             }
             if (nativeFallbackCount >= 2) {
-                reportError(view, requestToken, url)
+                reportError(view, requestToken, url, "$reason;native_fallback_attempts_exhausted")
                 return
             }
             nativeFallbackCount += 1
@@ -1591,7 +1739,7 @@ private fun createReaderWebView(
                         view.tag = ReaderWebViewLoad(nextReaderWebViewToken(), url)
                         view.loadDataWithBaseURL(url, html, "text/html", "UTF-8", url)
                     } else {
-                        reportError(view, requestToken, url)
+                        reportError(view, requestToken, url, "$reason;native_fallback_failed")
                     }
                 }
             }
@@ -1625,7 +1773,7 @@ private fun createReaderWebView(
                             if (nativeFallbackInFlightToken == requestToken) nativeFallbackInFlightToken = 0L
                         } else if (finalAttempt && requestToken == webViewLoadToken(view)) {
                             if (nativeFallbackInFlightToken != requestToken) {
-                                tryNativeFallback(view, url, requestToken)
+                                tryNativeFallback(view, url, requestToken, "payload_unusable_or_not_found")
                             }
                         }
                     }
@@ -1642,7 +1790,7 @@ private fun createReaderWebView(
                     if (acceptedPayloadToken == requestToken) return@postDelayed
                     val currentUrl = view.url.orEmpty()
                     if (currentUrl.isEmpty() || sameUrl(currentUrl, url)) {
-                        tryNativeFallback(view, url, requestToken)
+                        tryNativeFallback(view, url, requestToken, "webview_load_timeout")
                     }
                 }, 7_000L)
             }
@@ -1657,7 +1805,12 @@ private fun createReaderWebView(
 
             override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
                 if (request.isForMainFrame) {
-                    tryNativeFallback(view, request.url.toString(), webViewLoadToken(view))
+                    tryNativeFallback(
+                        view,
+                        request.url.toString(),
+                        webViewLoadToken(view),
+                        "webview_error code=${error.errorCode} description=${error.description}"
+                    )
                 }
             }
 
@@ -1667,7 +1820,12 @@ private fun createReaderWebView(
                 errorResponse: android.webkit.WebResourceResponse
             ) {
                 if (request.isForMainFrame) {
-                    tryNativeFallback(view, request.url.toString(), webViewLoadToken(view))
+                    tryNativeFallback(
+                        view,
+                        request.url.toString(),
+                        webViewLoadToken(view),
+                        "http_error status=${errorResponse.statusCode} reason=${errorResponse.reasonPhrase}"
+                    )
                 }
             }
         }
@@ -1866,6 +2024,9 @@ private fun ReaderScreen(
     document: ReaderDocument?,
     loading: Boolean,
     errorMessage: String?,
+    diagnosticLog: String,
+    onCopyDiagnosticLog: () -> Unit,
+    onShareDiagnosticLog: () -> Unit,
     settings: ReaderSettings,
     readingOffset: Int?,
     chapterOpenPosition: ChapterOpenPosition?,
@@ -1916,7 +2077,14 @@ private fun ReaderScreen(
         ) {
             when {
                 loading -> LoadingView(palette)
-                errorMessage != null -> ErrorView(errorMessage, palette, onReload)
+                errorMessage != null -> ErrorView(
+                     message = errorMessage,
+                     palette = palette,
+                     diagnosticLog = diagnosticLog,
+                     onCopyDiagnosticLog = onCopyDiagnosticLog,
+                     onShareDiagnosticLog = onShareDiagnosticLog,
+                     onReload = onReload
+                 )
                 document == null -> LoadingView(palette)
                 document.isCatalog -> CatalogView(
                     document = document,
@@ -1927,7 +2095,9 @@ private fun ReaderScreen(
                     catalogComplete = catalogComplete,
                     catalogError = catalogError,
                     onRetryCatalog = onRetryCatalog,
-                    onNavigate = onNavigate
+                    onNavigate = onNavigate,
+                     onCopyDiagnosticLog = onCopyDiagnosticLog,
+                     onShareDiagnosticLog = onShareDiagnosticLog
                 )
                 else -> ChapterView(
                     document = document,
@@ -2008,7 +2178,9 @@ private fun ReaderScreen(
                     loading = catalogLoading,
                     palette = palette,
                     settings = settings,
-                    onNavigate = { href, index ->
+                    onCopyDiagnosticLog = onCopyDiagnosticLog,
+                     onShareDiagnosticLog = onShareDiagnosticLog,
+                     onNavigate = { href, index ->
                         panel = ReaderPanel.NONE.name
                         onNavigateFromCatalog(href, catalogDocument?.sourceUrl.orEmpty(), index)
                     },
@@ -2256,6 +2428,8 @@ private fun CatalogDrawer(
     errorMessage: String?,
     onNavigate: (String, Int) -> Unit,
     onRetryCatalog: () -> Unit,
+    onCopyDiagnosticLog: () -> Unit,
+    onShareDiagnosticLog: () -> Unit,
     onClose: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -2361,6 +2535,24 @@ private fun CatalogDrawer(
                                             contentPadding = PaddingValues(0.dp)
                                         ) {
                                             Text("重试自动加载", color = palette.accent, fontSize = 10.sp)
+                                        }
+                                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            TextButton(
+                                                onClick = onCopyDiagnosticLog,
+                                                contentPadding = PaddingValues(0.dp)
+                                            ) {
+                                                Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(14.dp))
+                                                Spacer(Modifier.width(3.dp))
+                                                Text("复制日志", color = palette.accent, fontSize = 10.sp)
+                                            }
+                                            TextButton(
+                                                onClick = onShareDiagnosticLog,
+                                                contentPadding = PaddingValues(0.dp)
+                                            ) {
+                                                Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(14.dp))
+                                                Spacer(Modifier.width(3.dp))
+                                                Text("分享日志", color = palette.accent, fontSize = 10.sp)
+                                            }
                                         }
                                     }
                                     complete -> Text("目录已全部加载", color = palette.muted, fontSize = 10.sp)
@@ -2533,7 +2725,9 @@ private fun CatalogView(
     catalogComplete: Boolean,
     catalogError: String?,
     onRetryCatalog: () -> Unit,
-    onNavigate: (String) -> Unit
+    onNavigate: (String) -> Unit,
+    onCopyDiagnosticLog: () -> Unit,
+    onShareDiagnosticLog: () -> Unit
 ) {
     val listState = rememberLazyListState()
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -2577,6 +2771,24 @@ private fun CatalogView(
                         Icon(Icons.Default.Refresh, contentDescription = null)
                         Spacer(Modifier.width(6.dp))
                         Text("重试自动加载", color = palette.accent, fontSize = 11.sp)
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        TextButton(
+                            onClick = onCopyDiagnosticLog,
+                            contentPadding = PaddingValues(0.dp)
+                        ) {
+                            Icon(Icons.Default.ContentCopy, contentDescription = null)
+                            Spacer(Modifier.width(4.dp))
+                            Text("复制日志", color = palette.accent, fontSize = 11.sp)
+                        }
+                        TextButton(
+                            onClick = onShareDiagnosticLog,
+                            contentPadding = PaddingValues(0.dp)
+                        ) {
+                            Icon(Icons.Default.Share, contentDescription = null)
+                            Spacer(Modifier.width(4.dp))
+                            Text("分享日志", color = palette.accent, fontSize = 11.sp)
+                        }
                     }
                 }
                 catalogComplete -> Text("目录已全部加载", color = palette.muted, fontSize = 11.sp)
@@ -3303,11 +3515,63 @@ private fun LoadingView(palette: ReaderPalette) {
 }
 
 @Composable
-private fun ErrorView(message: String, palette: ReaderPalette, onReload: () -> Unit) {
-    Box(modifier = Modifier.fillMaxSize().padding(28.dp), contentAlignment = Alignment.Center) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(message, color = palette.ink, fontSize = 15.sp)
+private fun ErrorView(
+    message: String,
+    palette: ReaderPalette,
+    diagnosticLog: String,
+    onCopyDiagnosticLog: () -> Unit,
+    onShareDiagnosticLog: () -> Unit,
+    onReload: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .safeDrawingPadding()
+            .padding(28.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                message,
+                color = palette.ink,
+                fontSize = 15.sp,
+                maxLines = 4,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "已记录 ${diagnosticLog.lineSequence().count { it.contains(" [") }} 条诊断事件，仅包含加载状态和网页地址，不包含正文内容",
+                color = palette.muted,
+                fontSize = 11.sp
+            )
             Spacer(Modifier.height(14.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onCopyDiagnosticLog,
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(7.dp)
+                ) {
+                    Icon(Icons.Default.ContentCopy, contentDescription = null)
+                    Spacer(Modifier.width(5.dp))
+                    Text("复制日志")
+                }
+                Button(
+                    onClick = onShareDiagnosticLog,
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(7.dp)
+                ) {
+                    Icon(Icons.Default.Share, contentDescription = null)
+                    Spacer(Modifier.width(5.dp))
+                    Text("分享日志")
+                }
+            }
+            Spacer(Modifier.height(10.dp))
             OutlinedButton(onClick = onReload, shape = RoundedCornerShape(7.dp)) {
                 Icon(Icons.Default.Refresh, contentDescription = null)
                 Spacer(Modifier.width(6.dp))
