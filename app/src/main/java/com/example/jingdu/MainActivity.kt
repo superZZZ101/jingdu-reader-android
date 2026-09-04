@@ -2226,9 +2226,7 @@ private fun CatalogDrawer(
             sameUrl(item.href, currentUrl) || sameChapter(item.label, currentTitle)
         } ?: -1
     }
-    val currentIndex = catalogIndex?.takeIf {
-        catalogDocument != null && it in catalogDocument.catalogItems.indices
-    } ?: matchedIndex
+    val currentIndex = matchedIndex
     val listState = rememberLazyListState()
     var positionedOnce by remember { mutableStateOf(false) }
     LaunchedEffect(
@@ -2280,9 +2278,15 @@ private fun CatalogDrawer(
                         Text("目录", color = palette.ink, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                         if (catalogDocument != null) {
                             Text(
-                                if (currentIndex >= 0) "当前位置：第${currentIndex + 1}章" else "请选择章节",
+                                if (currentIndex >= 0) {
+                                    val item = catalogDocument.catalogItems[currentIndex]
+                                    val number = chapterNumber(item.label)
+                                    if (number != null) "当前位置：第${number}章" else "当前位置：${item.label}"
+                                } else "请选择章节",
                                 color = palette.muted,
-                                fontSize = 11.sp
+                                fontSize = 11.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
                     }
@@ -2609,24 +2613,8 @@ private fun VerticalChapterView(
     val currentEndIndex = currentStartIndex + document.paragraphs.size
     val nextStartIndex = currentEndIndex + 1
     val totalItemCount = nextChapter?.let { nextStartIndex + it.paragraphs.size + 1 } ?: (currentEndIndex + 1)
-    var knownPreviousItemCount by remember(document.sourceUrl) { mutableStateOf(previousItemCount) }
     var suppressBoundaryNavigation by remember(document.sourceUrl) { mutableStateOf(false) }
     var userScrollGeneration by remember { mutableStateOf(0) }
-
-    LaunchedEffect(document.sourceUrl, previousChapter?.sourceUrl, previousItemCount) {
-        val delta = previousItemCount - knownPreviousItemCount
-        if (delta != 0) {
-            suppressBoundaryNavigation = true
-            try {
-                val anchoredIndex = (listState.firstVisibleItemIndex + delta).coerceIn(0, max(0, totalItemCount - 1))
-                listState.scrollToItem(anchoredIndex, listState.firstVisibleItemScrollOffset)
-                delay(250)
-            } finally {
-                suppressBoundaryNavigation = false
-            }
-        }
-        knownPreviousItemCount = previousItemCount
-    }
 
     LaunchedEffect(document.sourceUrl, chapterOpenPosition, verticalOpenIndex, verticalOpenOffset) {
         positionRestored = false
@@ -2650,12 +2638,14 @@ private fun VerticalChapterView(
         val target = currentStartIndex + relativeIndex
         val offset = if (hasContinuationPosition) verticalOpenOffset?.coerceAtLeast(0) ?: 0 else 0
         suppressBoundaryNavigation = true
+        var restored = false
         try {
             listState.scrollToItem(target.coerceIn(0, max(0, totalItemCount - 1)), offset)
             delay(50)
+            restored = true
         } finally {
             suppressBoundaryNavigation = false
-            positionRestored = true
+            if (restored) positionRestored = true
         }
     }
     LaunchedEffect(
@@ -2668,11 +2658,25 @@ private fun VerticalChapterView(
         nextStartIndex
     ) {
         snapshotFlow {
-            Triple(positionRestored, listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset)
+            Triple(
+                positionRestored,
+                suppressBoundaryNavigation,
+                listState.isScrollInProgress
+            ) to Pair(
+                listState.firstVisibleItemIndex,
+                listState.firstVisibleItemScrollOffset
+            )
         }
             .distinctUntilChanged()
-            .collectLatest { (restored, index, _) ->
-                if (!restored || index < 0) return@collectLatest
+            .collectLatest { (flags, _) ->
+                val (restored, suppressed, scrolling) = flags
+                if (!restored || suppressed || scrolling) return@collectLatest
+                delay(120)
+                if (!positionRestored || suppressBoundaryNavigation || listState.isScrollInProgress) {
+                    return@collectLatest
+                }
+                val index = listState.firstVisibleItemIndex
+                if (index < 0) return@collectLatest
                 val targetDocument: ReaderDocument
                 val relativeIndex: Int
                 when {
