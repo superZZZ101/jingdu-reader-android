@@ -2880,15 +2880,22 @@ private fun HorizontalChapterView(
         val contentHeightPx = with(density) {
             (maxHeight - HorizontalPageTopPadding - HorizontalPageBottomPadding).toPx().toInt()
         }.coerceAtLeast(1)
+        val headerHeightPx = remember(document.sourceUrl, document.title, contentWidthPx) {
+            horizontalHeaderHeightPx(document, textMeasurer, density, contentWidthPx)
+        }
+        val nextHeaderHeightPx = remember(nextChapter?.sourceUrl, nextChapter?.title, contentWidthPx) {
+            nextChapter?.let { horizontalHeaderHeightPx(it, textMeasurer, density, contentWidthPx) } ?: 0
+        }
         val pages = remember(
             document.sourceUrl,
             document.paragraphs,
             settings.fontSize,
             settings.lineHeight,
             contentWidthPx,
-            contentHeightPx
+            contentHeightPx,
+            headerHeightPx
         ) {
-            paginateChapterPages(document, textMeasurer, density, contentWidthPx, contentHeightPx, settings)
+            paginateChapterPages(document, textMeasurer, density, contentWidthPx, contentHeightPx, headerHeightPx, settings)
         }
         val hasNextChapter = document.navigation.next != null
         val nextPages = remember(
@@ -2897,11 +2904,12 @@ private fun HorizontalChapterView(
             settings.fontSize,
             settings.lineHeight,
             contentWidthPx,
-            contentHeightPx
+            contentHeightPx,
+            nextHeaderHeightPx
         ) {
             nextChapter
                 ?.takeIf { nextChapterReady && !it.isCatalog && it.paragraphs.isNotEmpty() }
-                ?.let { paginateChapterPages(it, textMeasurer, density, contentWidthPx, contentHeightPx, settings) }
+                ?.let { paginateChapterPages(it, textMeasurer, density, contentWidthPx, contentHeightPx, nextHeaderHeightPx, settings) }
                 .orEmpty()
         }
         val showNextContent = hasNextChapter && nextPages.isNotEmpty()
@@ -3002,6 +3010,7 @@ private fun HorizontalChapterView(
                         document = nextChapter!!,
                         text = nextPages[nextPage].text,
                         page = nextPage,
+                        headerHeightPx = nextHeaderHeightPx,
                         palette = palette,
                         settings = settings
                     )
@@ -3010,6 +3019,7 @@ private fun HorizontalChapterView(
                         document = document,
                         text = pages[page].text,
                         page = page,
+                        headerHeightPx = headerHeightPx,
                         palette = palette,
                         settings = settings
                     )
@@ -3030,13 +3040,47 @@ private fun HorizontalChapterView(
 private val HorizontalPageHorizontalPadding = 22.dp
 private val HorizontalPageTopPadding = 64.dp
 private val HorizontalPageBottomPadding = 52.dp
-private val HorizontalHeaderReservedHeight = 160.dp
+
+private fun horizontalHeaderHeightPx(
+    document: ReaderDocument,
+    textMeasurer: TextMeasurer,
+    density: Density,
+    contentWidthPx: Int
+): Int {
+    fun measuredHeight(text: String, style: TextStyle): Int = textMeasurer.measure(
+        text = AnnotatedString(text),
+        style = style,
+        overflow = TextOverflow.Clip,
+        softWrap = true,
+        maxLines = Int.MAX_VALUE,
+        constraints = Constraints(maxWidth = contentWidthPx.coerceAtLeast(1))
+    ).size.height
+
+    val labelHeight = measuredHeight(
+        "静读 · 当前章节",
+        TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Bold)
+    )
+    val titleHeight = measuredHeight(
+        document.title.ifEmpty { " " },
+        TextStyle(fontSize = 30.sp, fontWeight = FontWeight.Bold, lineHeight = 38.sp)
+    )
+    val metadataHeight = measuredHeight(
+        "${document.paragraphs.size} 段 · ${document.wordCount} 字",
+        TextStyle(fontSize = 12.sp)
+    )
+    val spacing = with(density) {
+        (12.dp.toPx() + 10.dp.toPx() + 19.dp.toPx() + 2.dp.toPx() + 13.dp.toPx()).toInt()
+    }
+    val safety = with(density) { 2.dp.toPx().toInt().coerceAtLeast(1) }
+    return labelHeight + titleHeight + metadataHeight + spacing + safety
+}
 
 @Composable
 private fun HorizontalChapterPage(
     document: ReaderDocument,
     text: String,
     page: Int,
+    headerHeightPx: Int,
     palette: ReaderPalette,
     settings: ReaderSettings
 ) {
@@ -3051,8 +3095,9 @@ private fun HorizontalChapterPage(
             )
     ) {
         if (page == 0) {
-            Box(modifier = Modifier.height(HorizontalHeaderReservedHeight)) {
-                ChapterHeader(document, palette)
+            val headerHeight = with(androidx.compose.ui.platform.LocalDensity.current) { headerHeightPx.toDp() }
+            Box(modifier = Modifier.height(headerHeight)) {
+                ChapterHeader(document, palette, titleMaxLines = Int.MAX_VALUE)
             }
         }
         Text(
@@ -3072,6 +3117,7 @@ private fun paginateChapterPages(
     density: Density,
     contentWidthPx: Int,
     contentHeightPx: Int,
+    headerHeightPx: Int,
     settings: ReaderSettings
 ): List<ChapterPage> {
     val style = TextStyle(
@@ -3080,7 +3126,6 @@ private fun paginateChapterPages(
         fontFamily = FontFamily.Serif
     )
     val fullText = document.paragraphs.joinToString("\n\n").trim()
-    val headerHeightPx = with(density) { HorizontalHeaderReservedHeight.toPx().toInt() }
     val textSafetyPx = with(density) { 1.dp.toPx().toInt().coerceAtLeast(1) }
     val firstHeight = (contentHeightPx - headerHeightPx - textSafetyPx).coerceAtLeast(1)
     val normalHeight = (contentHeightPx - textSafetyPx).coerceAtLeast(1)
