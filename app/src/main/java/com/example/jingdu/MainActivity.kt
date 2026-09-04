@@ -438,6 +438,23 @@ private fun JingduApp(initialUrl: String = "") {
         return cachedDocuments[key] ?: cachedDocuments.values.firstOrNull { cacheKey(it.sourceUrl) == key }
     }
 
+    fun hasUncachedPageContinuation(start: ReaderDocument): Boolean {
+        var current = start
+        val visited = mutableSetOf<String>()
+        while (visited.size < 8) {
+            val currentKey = cacheKey(current.sourceUrl)
+            if (currentKey.isEmpty() || !visited.add(currentKey)) return false
+            val nextUrl = current.navigation.nextPage?.href?.let(::normalizeUrl).orEmpty()
+            if (nextUrl.isEmpty()) return false
+            val nextKey = cacheKey(nextUrl)
+            if (nextKey.isEmpty() || nextKey in visited) return false
+            val continuation = findCached(nextUrl) ?: return true
+            if (continuation.isCatalog || continuation.paragraphs.isEmpty()) return true
+            current = continuation
+        }
+        return current.navigation.nextPage?.href?.let(::normalizeUrl)?.isNotEmpty() == true
+    }
+
     fun invalidateCatalogCache(rawRootUrl: String) {
         val rootUrl = normalizeUrl(rawRootUrl)
         val rootKey = cacheKey(rootUrl)
@@ -830,8 +847,9 @@ private fun JingduApp(initialUrl: String = "") {
             null
         }
         val cached = if (forceReload) null else findCached(normalized)
-        val needsPreviousPageChain = cached != null && openPosition == ChapterOpenPosition.END &&
-            !cached.isCatalog && cached.navigation.nextPage?.href?.let(::normalizeUrl)?.let { findCached(it) } == null
+        val needsPreviousPageChain = cached != null && !cached.isCatalog &&
+            (openPosition == ChapterOpenPosition.END || verticalIndexOverride != null) &&
+            hasUncachedPageContinuation(cached)
         if (needsPreviousPageChain) {
             pendingChapterNavigation = pendingNavigation
             previousPageBaseUrl = ""
@@ -1213,6 +1231,21 @@ private fun JingduApp(initialUrl: String = "") {
             }
         }
     }
+    LaunchedEffect(prefetchLoadUrl) {
+        val target = prefetchLoadUrl
+        if (target.isEmpty()) return@LaunchedEffect
+        delay(20_000)
+        if (!sameUrl(prefetchLoadUrl, target)) return@LaunchedEffect
+        val pending = pendingChapterNavigation
+        val waitingForTarget = pending != null && sameUrl(pending.url, target)
+        prefetchLoadUrl = ""
+        prefetchPageBaseUrl = ""
+        prefetchRetryUrl = ""
+        prefetchRetryCount = 0
+        prefetchRetryScheduled = false
+        restartPrefetchWebView()
+        if (waitingForTarget) fallbackPendingChapterToActive(target)
+    }
     LaunchedEffect(previousWebView, previousLoadUrl) {
         val target = previousLoadUrl
         val view = previousWebView
@@ -1227,6 +1260,20 @@ private fun JingduApp(initialUrl: String = "") {
                 }
             }
         }
+    }
+    LaunchedEffect(previousLoadUrl) {
+        val target = previousLoadUrl
+        if (target.isEmpty()) return@LaunchedEffect
+        delay(20_000)
+        if (!sameUrl(previousLoadUrl, target)) return@LaunchedEffect
+        val pending = pendingChapterNavigation
+        val fallbackTarget = pending?.url?.takeIf {
+            sameUrl(it, target) || (previousPageBaseUrl.isNotEmpty() && sameUrl(it, previousPageBaseUrl))
+        }
+        previousLoadUrl = ""
+        previousPageBaseUrl = ""
+        restartPreviousWebView()
+        fallbackTarget?.let(::fallbackPendingChapterToActive)
     }
     LaunchedEffect(catalogWebView, catalogLoadUrl) {
         val target = catalogLoadUrl
@@ -2322,7 +2369,7 @@ private fun CatalogDrawer(
                         }
                         itemsIndexed(
                             catalogDocument.catalogItems,
-                            key = { index, item -> "drawer_${index}_${item.href}" }
+                            key = { _, item -> "drawer_${readerUrlKey(item.href).ifEmpty { item.href.trim() }}" }
                         ) { index, item ->
                             val selected = index == currentIndex
                             Row(
@@ -2483,14 +2530,21 @@ private fun CatalogView(
     val listState = rememberLazyListState()
     val context = androidx.compose.ui.platform.LocalContext.current
     val preferences = remember { context.getSharedPreferences("jingdu", 0) }
+    var positionRestored by remember(document.sourceUrl) { mutableStateOf(false) }
     LaunchedEffect(document.sourceUrl) {
+        positionRestored = false
         val saved = preferences.getInt(progressKey(document.sourceUrl), 0)
         listState.scrollToItem(min(saved, max(0, document.catalogItems.size)))
+        positionRestored = true
     }
     LaunchedEffect(listState, document.sourceUrl) {
-        snapshotFlow { listState.firstVisibleItemIndex }
+        snapshotFlow {
+            positionRestored to listState.firstVisibleItemIndex
+        }
             .distinctUntilChanged()
-            .collectLatest { index -> preferences.edit().putInt(progressKey(document.sourceUrl), index).apply() }
+            .collectLatest { (restored, index) ->
+                if (restored) preferences.edit().putInt(progressKey(document.sourceUrl), index).apply()
+            }
     }
     LazyColumn(
         state = listState,
@@ -2521,7 +2575,7 @@ private fun CatalogView(
             }
             Spacer(Modifier.height(22.dp))
         }
-        itemsIndexed(document.catalogItems, key = { index, item -> "${index}_${item.href}" }) { index, item ->
+        itemsIndexed(document.catalogItems, key = { _, item -> "catalog_${readerUrlKey(item.href).ifEmpty { item.href.trim() }}" }) { index, item ->
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -3237,7 +3291,7 @@ private fun sameUrl(first: String, second: String): Boolean {
 private fun sameChapter(first: String, second: String): Boolean {
     val firstNumber = chapterNumber(first)
     val secondNumber = chapterNumber(second)
-    if (firstNumber != null && firstNumber == secondNumber) return true
+    if (firstNumber != null && secondNumber != null && firstNumber != secondNumber) return false
     val firstTitle = chapterTitleKey(first)
     val secondTitle = chapterTitleKey(second)
     return firstTitle.length >= 6 && secondTitle.length >= 6 &&
