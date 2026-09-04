@@ -2481,6 +2481,7 @@ private fun Modifier.verticalBoundaryGestureDetector(
 private fun Modifier.horizontalPageGestureDetector(
     key: Any,
     currentPage: () -> Int,
+    onUserGesture: () -> Unit,
     onTap: (tappedLeft: Boolean) -> Unit,
     onSwipe: (swipedRight: Boolean, pageAtDown: Int) -> Unit
 ): Modifier = pointerInput(key) {
@@ -2505,11 +2506,18 @@ private fun Modifier.horizontalPageGestureDetector(
         val horizontalSwipe = moved && kotlin.math.abs(delta.x) > kotlin.math.abs(delta.y) &&
             kotlin.math.abs(delta.x) >= size.width * 0.16f
         if (horizontalSwipe) {
+            onUserGesture()
             onSwipe(delta.x > 0f, pageAtDown)
         } else if (!moved && !consumed) {
             when {
-                start.x < size.width * 0.34f -> onTap(true)
-                start.x > size.width * 0.66f -> onTap(false)
+                start.x < size.width * 0.34f -> {
+                    onUserGesture()
+                    onTap(true)
+                }
+                start.x > size.width * 0.66f -> {
+                    onUserGesture()
+                    onTap(false)
+                }
             }
         }
     }
@@ -2795,6 +2803,10 @@ private fun VerticalChapterView(
                 if (firstVisible < 0 || viewport.scrolling) return@collectLatest
                 if (scrollGeneration <= lastHandledUserScrollGeneration) return@collectLatest
                 lastHandledUserScrollGeneration = scrollGeneration
+                if (nextChapter == null && viewport.lastVisible >= currentEndIndex && !viewport.canScrollForward) {
+                    onAutoNext()
+                    return@collectLatest
+                }
                 val inPreviousChapter = previousChapter != null && firstVisible in 0 until currentStartIndex
                 val inNextChapter = nextChapter != null && firstVisible >= nextStartIndex
                 when {
@@ -2923,6 +2935,7 @@ private fun HorizontalChapterView(
         val horizontalProgressKey = progressKey(document.sourceUrl) + "_horizontal"
         val offsetKey = progressOffsetKey(document.sourceUrl)
         var positionRestored by remember(document.sourceUrl) { mutableStateOf(false) }
+        var horizontalUserScrollGeneration by remember(document.sourceUrl) { mutableStateOf(0) }
 
         LaunchedEffect(document.sourceUrl, chapterOpenPosition, pages.size, settings.fontSize, settings.lineHeight, contentWidthPx, contentHeightPx) {
             positionRestored = false
@@ -2965,6 +2978,23 @@ private fun HorizontalChapterView(
             if (showNextContent && pagerState.currentPage >= pages.size) onAutoNext()
         }
 
+        LaunchedEffect(pagerState, document.sourceUrl, pages.size, showNextContent) {
+            var lastHandledUserGesture = horizontalUserScrollGeneration
+            snapshotFlow {
+                Triple(
+                    horizontalUserScrollGeneration,
+                    pagerState.currentPage,
+                    pagerState.isScrollInProgress
+                )
+            }
+                .distinctUntilChanged()
+                .collectLatest { (generation, page, scrolling) ->
+                    if (generation <= lastHandledUserGesture || scrolling) return@collectLatest
+                    lastHandledUserGesture = generation
+                    if (!showNextContent && page >= pages.lastIndex) onAutoNext()
+                }
+        }
+
         Box(modifier = Modifier.fillMaxSize()) {
             HorizontalPager(
                 state = pagerState,
@@ -2973,6 +3003,7 @@ private fun HorizontalChapterView(
                     .horizontalPageGestureDetector(
                         key = Triple(document.sourceUrl, totalPages, settings.horizontalTapMode),
                         currentPage = { pagerState.currentPage },
+                        onUserGesture = { horizontalUserScrollGeneration += 1 },
                         onTap = { tappedLeft ->
                             val current = pagerState.currentPage
                             val target = if (settings.horizontalTapMode == HorizontalTapMode.BOTH_NEXT || !tappedLeft) {
