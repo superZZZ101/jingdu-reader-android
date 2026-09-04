@@ -2227,6 +2227,7 @@ private fun CatalogDrawer(
         catalogDocument != null && it in catalogDocument.catalogItems.indices
     } ?: matchedIndex
     val listState = rememberLazyListState()
+    var positionedOnce by remember { mutableStateOf(false) }
     LaunchedEffect(
         catalogDocument?.sourceUrl,
         catalogItemCount,
@@ -2235,7 +2236,8 @@ private fun CatalogDrawer(
         currentTitle,
         currentIndex
     ) {
-        if (currentIndex >= 0) {
+        if (currentIndex >= 0 && !positionedOnce) {
+            positionedOnce = true
             val targetIndex = currentIndex + 1
             listState.scrollToItem(targetIndex)
             val targetItem = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == targetIndex }
@@ -2384,8 +2386,7 @@ private fun Modifier.centerTapDetector(onTap: () -> Unit): Modifier = pointerInp
             }
             finished = event.changes.none { it.pressed }
         }
-        val inCenter = start.x in (size.width * 0.35f)..(size.width * 0.65f) &&
-            start.y in (size.height * 0.40f)..(size.height * 0.60f)
+        val inCenter = start.x in (size.width * 0.34f)..(size.width * 0.66f)
         if (!moved && !consumed && inCenter) onTap()
     }
 }
@@ -2451,8 +2452,8 @@ private fun Modifier.horizontalPageGestureDetector(
             onSwipe(delta.x > 0f, pageAtDown)
         } else if (!moved && !consumed) {
             when {
-                start.x < size.width * 0.2f -> onTap(true)
-                start.x > size.width * 0.8f -> onTap(false)
+                start.x < size.width * 0.34f -> onTap(true)
+                start.x > size.width * 0.66f -> onTap(false)
             }
         }
     }
@@ -2651,6 +2652,7 @@ private fun VerticalChapterView(
         } finally {
             suppressBoundaryNavigation = false
             positionRestored = true
+            boundaryCooldownUntil.value = System.currentTimeMillis() + 900L
         }
     }
     LaunchedEffect(
@@ -2708,6 +2710,7 @@ private fun VerticalChapterView(
         nextStartIndex
     ) {
         var lastHandledIndex = -1
+        var previousSettledIndex = -1
         snapshotFlow {
             VerticalViewport(
                 scrolling = listState.isScrollInProgress,
@@ -2727,12 +2730,14 @@ private fun VerticalChapterView(
                 }
                 val firstVisible = viewport.firstVisible
                 if (firstVisible < 0 || viewport.scrolling) return@collectLatest
-                val settled = firstVisible != lastHandledIndex
-                if (!settled) return@collectLatest
+                if (firstVisible == lastHandledIndex) return@collectLatest
+                // 章节刚打开/恢复时不做任何边界处理：只有视口确实从
+                // 一个稳定位置移动到另一个位置（真实滚动）后才衔接相邻章节。
+                val moved = previousSettledIndex >= 0 && firstVisible != previousSettledIndex
+                previousSettledIndex = firstVisible
+                if (!moved) return@collectLatest
                 val inPreviousChapter = previousChapter != null && firstVisible in 0 until currentStartIndex
                 val inNextChapter = nextChapter != null && firstVisible >= nextStartIndex
-                val atPreviousEdge = previousChapter == null && !viewport.canScrollBackward && document.navigation.previous != null
-                val atNextEdge = nextChapter == null && !viewport.canScrollForward && document.navigation.next != null
                 when {
                     inPreviousChapter -> {
                         lastHandledIndex = firstVisible
@@ -2756,16 +2761,6 @@ private fun VerticalChapterView(
                             )
                         }
                     }
-                    atPreviousEdge -> {
-                        lastHandledIndex = firstVisible
-                        boundaryCooldownUntil.value = System.currentTimeMillis() + 800L
-                        document.navigation.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.END) }
-                    }
-                    atNextEdge -> {
-                        lastHandledIndex = firstVisible
-                        boundaryCooldownUntil.value = System.currentTimeMillis() + 800L
-                        onAutoNext()
-                    }
                 }
             }
     }
@@ -2786,17 +2781,17 @@ private fun VerticalChapterView(
         verticalArrangement = Arrangement.spacedBy(17.dp)
     ) {
         if (previousChapter != null) {
-            item(key = "${previousChapter.sourceUrl}:header") { ChapterHeader(previousChapter, palette) }
+            item(key = "${previousChapter.sourceUrl}:header") { ChapterHeader(previousChapter, palette, titleMaxLines = Int.MAX_VALUE) }
             itemsIndexed(previousChapter.paragraphs, key = { index, _ -> "${previousChapter.sourceUrl}:paragraph:$index" }) { _, paragraph ->
                 ChapterParagraph(paragraph, palette, settings)
             }
         }
-        item(key = "${document.sourceUrl}:header") { ChapterHeader(document, palette) }
+        item(key = "${document.sourceUrl}:header") { ChapterHeader(document, palette, titleMaxLines = Int.MAX_VALUE) }
         itemsIndexed(document.paragraphs, key = { index, _ -> "${document.sourceUrl}:paragraph:$index" }) { _, paragraph ->
             ChapterParagraph(paragraph, palette, settings)
         }
         if (nextChapter != null) {
-            item(key = "${nextChapter.sourceUrl}:header") { ChapterHeader(nextChapter, palette) }
+            item(key = "${nextChapter.sourceUrl}:header") { ChapterHeader(nextChapter, palette, titleMaxLines = Int.MAX_VALUE) }
             itemsIndexed(nextChapter.paragraphs, key = { index, _ -> "${nextChapter.sourceUrl}:paragraph:$index" }) { _, paragraph ->
                 ChapterParagraph(paragraph, palette, settings)
             }
@@ -2974,7 +2969,7 @@ private fun HorizontalChapterView(
 
 private val HorizontalPageHorizontalPadding = 22.dp
 private val HorizontalPageTopPadding = 64.dp
-private val HorizontalPageBottomPadding = 42.dp
+private val HorizontalPageBottomPadding = 52.dp
 private val HorizontalHeaderReservedHeight = 160.dp
 
 @Composable
@@ -3122,7 +3117,11 @@ private fun AutoNextView(palette: ReaderPalette) {
 }
 
 @Composable
-private fun ChapterHeader(document: ReaderDocument, palette: ReaderPalette) {
+private fun ChapterHeader(
+    document: ReaderDocument,
+    palette: ReaderPalette,
+    titleMaxLines: Int = 2
+) {
     Column {
         Text("静读 · 当前章节", color = palette.accent, fontSize = 11.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(12.dp))
@@ -3132,7 +3131,7 @@ private fun ChapterHeader(document: ReaderDocument, palette: ReaderPalette) {
             fontSize = 30.sp,
             fontWeight = FontWeight.Bold,
             lineHeight = 38.sp,
-            maxLines = 2,
+            maxLines = titleMaxLines,
             overflow = TextOverflow.Ellipsis
         )
         Spacer(Modifier.height(10.dp))
