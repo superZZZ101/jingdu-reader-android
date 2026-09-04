@@ -1106,7 +1106,10 @@ private fun JingduApp(initialUrl: String = "") {
                 previousPageBaseUrl = ""
                 previousLoadUrl = ""
                 val pending = pendingChapterNavigation
-                if (pending == null || sameUrl(pending.url, merged.sourceUrl) || (baseUrl.isNotEmpty() && sameUrl(pending.url, baseUrl))) {
+                if (pending != null && (
+                        sameUrl(pending.url, merged.sourceUrl) ||
+                            (baseUrl.isNotEmpty() && sameUrl(pending.url, baseUrl))
+                    )) {
                     pendingChapterNavigation = null
                     showDocument(
                         merged,
@@ -2395,6 +2398,7 @@ private fun Modifier.verticalBoundaryGestureDetector(
     key: Any,
     canScrollBackward: () -> Boolean,
     canScrollForward: () -> Boolean,
+    onUserScroll: () -> Unit,
     onSwipeBackward: () -> Unit,
     onSwipeForward: () -> Unit
 ): Modifier = pointerInput(key) {
@@ -2413,9 +2417,9 @@ private fun Modifier.verticalBoundaryGestureDetector(
             finished = event.changes.none { it.pressed }
         }
         val delta = last - start
-        if (moved && kotlin.math.abs(delta.y) > kotlin.math.abs(delta.x) &&
-            kotlin.math.abs(delta.y) >= size.height * 0.12f
-        ) {
+        val verticalMovement = moved && kotlin.math.abs(delta.y) >= kotlin.math.abs(delta.x)
+        if (verticalMovement) onUserScroll()
+        if (verticalMovement && kotlin.math.abs(delta.y) >= size.height * 0.12f) {
             if (delta.y < 0f && !canScrollForward()) onSwipeForward()
             if (delta.y > 0f && !canScrollBackward()) onSwipeBackward()
         }
@@ -2607,7 +2611,7 @@ private fun VerticalChapterView(
     val totalItemCount = nextChapter?.let { nextStartIndex + it.paragraphs.size + 1 } ?: (currentEndIndex + 1)
     var knownPreviousItemCount by remember(document.sourceUrl) { mutableStateOf(previousItemCount) }
     var suppressBoundaryNavigation by remember(document.sourceUrl) { mutableStateOf(false) }
-    val boundaryCooldownUntil = remember { mutableStateOf(0L) }
+    var userScrollGeneration by remember { mutableStateOf(0) }
 
     LaunchedEffect(document.sourceUrl, previousChapter?.sourceUrl, previousItemCount) {
         val delta = previousItemCount - knownPreviousItemCount
@@ -2652,7 +2656,6 @@ private fun VerticalChapterView(
         } finally {
             suppressBoundaryNavigation = false
             positionRestored = true
-            boundaryCooldownUntil.value = System.currentTimeMillis() + 900L
         }
     }
     LaunchedEffect(
@@ -2709,39 +2712,34 @@ private fun VerticalChapterView(
         currentEndIndex,
         nextStartIndex
     ) {
-        var lastHandledIndex = -1
-        var previousSettledIndex = -1
+        var lastHandledUserScrollGeneration = userScrollGeneration
         snapshotFlow {
-            VerticalViewport(
-                scrolling = listState.isScrollInProgress,
-                firstVisible = listState.layoutInfo.visibleItemsInfo.firstOrNull()?.index ?: -1,
-                firstOffset = listState.firstVisibleItemScrollOffset,
-                lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1,
-                canScrollBackward = listState.canScrollBackward,
-                canScrollForward = listState.canScrollForward
+            Pair(
+                Triple(userScrollGeneration, positionRestored, suppressBoundaryNavigation),
+                VerticalViewport(
+                    scrolling = listState.isScrollInProgress,
+                    firstVisible = listState.layoutInfo.visibleItemsInfo.firstOrNull()?.index ?: -1,
+                    firstOffset = listState.firstVisibleItemScrollOffset,
+                    lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1,
+                    canScrollBackward = listState.canScrollBackward,
+                    canScrollForward = listState.canScrollForward
+                )
             )
         }
             .distinctUntilChanged()
-            .collectLatest { viewport ->
-                if (!positionRestored || suppressBoundaryNavigation ||
-                    System.currentTimeMillis() < boundaryCooldownUntil.value
-                ) {
+            .collectLatest { (flags, viewport) ->
+                val (scrollGeneration, restored, suppressed) = flags
+                if (!restored || suppressed) {
                     return@collectLatest
                 }
                 val firstVisible = viewport.firstVisible
                 if (firstVisible < 0 || viewport.scrolling) return@collectLatest
-                if (firstVisible == lastHandledIndex) return@collectLatest
-                // 章节刚打开/恢复时不做任何边界处理：只有视口确实从
-                // 一个稳定位置移动到另一个位置（真实滚动）后才衔接相邻章节。
-                val moved = previousSettledIndex >= 0 && firstVisible != previousSettledIndex
-                previousSettledIndex = firstVisible
-                if (!moved) return@collectLatest
+                if (scrollGeneration <= lastHandledUserScrollGeneration) return@collectLatest
+                lastHandledUserScrollGeneration = scrollGeneration
                 val inPreviousChapter = previousChapter != null && firstVisible in 0 until currentStartIndex
                 val inNextChapter = nextChapter != null && firstVisible >= nextStartIndex
                 when {
                     inPreviousChapter -> {
-                        lastHandledIndex = firstVisible
-                        boundaryCooldownUntil.value = System.currentTimeMillis() + 800L
                         document.navigation.previous?.let {
                             onContinueToChapter(
                                 it.href,
@@ -2751,8 +2749,6 @@ private fun VerticalChapterView(
                         }
                     }
                     inNextChapter -> {
-                        lastHandledIndex = firstVisible
-                        boundaryCooldownUntil.value = System.currentTimeMillis() + 800L
                         document.navigation.next?.let {
                             onContinueToChapter(
                                 it.href,
@@ -2772,6 +2768,7 @@ private fun VerticalChapterView(
                 key = Triple(document.sourceUrl, previousChapter?.sourceUrl, nextChapter?.sourceUrl),
                 canScrollBackward = { listState.canScrollBackward },
                 canScrollForward = { listState.canScrollForward },
+                onUserScroll = { userScrollGeneration += 1 },
                 onSwipeBackward = {
                     if (previousChapter == null) document.navigation.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.END) }
                 },
