@@ -34,6 +34,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -2813,7 +2814,11 @@ private fun HorizontalChapterView(
     onNavigateChapter: (String, ChapterOpenPosition) -> Unit,
     onAutoNext: () -> Unit
 ) {
-    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxSize()
+            .safeDrawingPadding()
+    ) {
         val density = androidx.compose.ui.platform.LocalDensity.current
         val textMeasurer = rememberTextMeasurer()
         val contentWidthPx = with(density) { (maxWidth - HorizontalPageHorizontalPadding * 2).toPx().toInt() }
@@ -3022,8 +3027,9 @@ private fun paginateChapterPages(
     )
     val fullText = document.paragraphs.joinToString("\n\n").trim()
     val headerHeightPx = with(density) { HorizontalHeaderReservedHeight.toPx().toInt() }
-    val firstHeight = (contentHeightPx - headerHeightPx).coerceAtLeast(1)
-    val normalHeight = contentHeightPx.coerceAtLeast(1)
+    val textSafetyPx = with(density) { 1.dp.toPx().toInt().coerceAtLeast(1) }
+    val firstHeight = (contentHeightPx - headerHeightPx - textSafetyPx).coerceAtLeast(1)
+    val normalHeight = (contentHeightPx - textSafetyPx).coerceAtLeast(1)
     val pages = mutableListOf<ChapterPage>()
     var remainder = fullText
     var firstPage = true
