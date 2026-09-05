@@ -44,6 +44,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.PagerDefaults
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -126,6 +127,9 @@ private enum class HorizontalTapMode { SIDE_PAGES, BOTH_NEXT }
 private enum class ScreenOrientation { PORTRAIT, LANDSCAPE, SYSTEM }
 private enum class ReaderPanel { NONE, SETTINGS, CATALOG }
 private enum class ChapterOpenPosition { START, END }
+
+private const val ReaderMenuTapStartFraction = 0.40f
+private const val ReaderMenuTapEndFraction = 0.60f
 
 private const val CATALOG_STATE_ROOT_KEY = "catalog_state_root"
 private const val CATALOG_STATE_LOADED_KEY = "catalog_state_loaded"
@@ -2857,7 +2861,7 @@ private fun Modifier.centerTapDetector(onTap: () -> Unit): Modifier = pointerInp
             }
             finished = event.changes.none { it.pressed }
         }
-        val inCenter = start.x in (size.width * 0.34f)..(size.width * 0.66f)
+        val inCenter = start.x in (size.width * ReaderMenuTapStartFraction)..(size.width * ReaderMenuTapEndFraction)
         if (!moved && !consumed && inCenter) onTap()
     }
 }
@@ -2919,18 +2923,17 @@ private fun Modifier.horizontalPageGestureDetector(
             finished = event.changes.none { it.pressed }
         }
         val delta = last - start
-        val horizontalSwipe = moved && kotlin.math.abs(delta.x) > kotlin.math.abs(delta.y) &&
-            kotlin.math.abs(delta.x) >= size.width * 0.16f
+        val horizontalSwipe = moved && kotlin.math.abs(delta.x) > kotlin.math.abs(delta.y)
         if (horizontalSwipe) {
             onUserGesture()
             onSwipe(delta.x > 0f, pageAtDown)
         } else if (!moved && !consumed) {
             when {
-                start.x < size.width * 0.34f -> {
+                start.x < size.width * ReaderMenuTapStartFraction -> {
                     onUserGesture()
                     onTap(true)
                 }
-                start.x > size.width * 0.66f -> {
+                start.x > size.width * ReaderMenuTapEndFraction -> {
                     onUserGesture()
                     onTap(false)
                 }
@@ -3483,6 +3486,10 @@ private fun HorizontalChapterView(
         Box(modifier = Modifier.fillMaxSize()) {
             HorizontalPager(
                 state = pagerState,
+                flingBehavior = PagerDefaults.flingBehavior(
+                    state = pagerState,
+                    snapPositionalThreshold = 0.10f
+                ),
                 modifier = Modifier
                     .fillMaxSize()
                     .horizontalPageGestureDetector(
@@ -3521,7 +3528,11 @@ private fun HorizontalChapterView(
                             }
                         },
                         onSwipe = { swipedRight, pageAtDown ->
+                            val target = if (swipedRight) pageAtDown - 1 else pageAtDown + 1
                             when {
+                                target in 0 until totalPages -> {
+                                    pagerScope.launch { pagerState.scrollToPage(target) }
+                                }
                                 swipedRight && pageAtDown == 0 -> {
                                     document.navigation.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.END) }
                                 }
