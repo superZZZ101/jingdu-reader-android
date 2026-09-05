@@ -3301,6 +3301,7 @@ private fun VerticalChapterView(
         state = listState,
         modifier = Modifier
             .fillMaxSize()
+            .navigationBarsPadding()
             .verticalBoundaryGestureDetector(
                 key = listOf(
                      document.sourceUrl,
