@@ -713,6 +713,12 @@ private fun JingduApp(initialUrl: String = "") {
         }
         val previous = result.navigation.previous?.href?.let(::normalizeUrl).orEmpty()
         val cachedPrevious = previous.takeIf { it.isNotEmpty() }?.let(::findCached)
+        val previousContinuation = cachedPrevious?.let(::uncachedPageContinuationUrl)
+        if (cachedPrevious != null && previousContinuation != null && !sameUrl(previousContinuation, cachedPrevious.sourceUrl)) {
+            previousPageBaseUrl = cacheKey(cachedPrevious.sourceUrl)
+            previousLoadUrl = previousContinuation
+            return
+        }
         val previousReady = cachedPrevious != null && cachedPrevious.isUsableForReading()
         previousLoadUrl = if (previous.isNotEmpty() && !previousReady && !sameUrl(previous, result.sourceUrl)) previous else ""
     }
@@ -990,17 +996,22 @@ private fun JingduApp(initialUrl: String = "") {
             null
         }
         val cached = if (forceReload) null else findCached(normalized)
+        val cachedContinuation = cached?.takeIf { !it.isCatalog }?.let(::uncachedPageContinuationUrl)
         val needsPreviousPageChain = cached != null && !cached.isCatalog &&
             (openPosition != null || verticalIndexOverride != null) &&
-            hasUncachedPageContinuation(cached)
+            cachedContinuation != null
         if (needsPreviousPageChain) {
+            val continuationBaseUrl = cacheKey(cached!!.sourceUrl)
+            val continuationTarget = cachedContinuation ?: normalized
+            val samePendingLoad = previousPageBaseUrl == continuationBaseUrl &&
+                sameUrl(previousLoadUrl, continuationTarget)
             restartPrefetchWebView()
             pendingChapterNavigation = pendingNavigation
-            previousPageBaseUrl = ""
-            previousLoadUrl = normalized
+            previousPageBaseUrl = continuationBaseUrl
+            previousLoadUrl = continuationTarget
             errorMessage = null
             loading = false
-            restartPreviousWebView()
+            if (!samePendingLoad) restartPreviousWebView()
             return
         }
         if (cached != null && document != null && !document!!.isCatalog && !cached.isCatalog &&
@@ -3492,7 +3503,13 @@ private fun HorizontalChapterView(
                             }
                             when {
                                 target in 0 until totalPages -> {
-                                    pagerScope.launch { pagerState.animateScrollToPage(target) }
+                                    pagerScope.launch {
+                                        if (target < current) {
+                                            pagerState.scrollToPage(target)
+                                        } else {
+                                            pagerState.animateScrollToPage(target)
+                                        }
+                                    }
                                 }
                                 tappedLeft && settings.horizontalTapMode == HorizontalTapMode.SIDE_PAGES && current == 0 -> {
                                     document.navigation.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.END) }
