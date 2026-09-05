@@ -690,6 +690,13 @@ private fun JingduApp(initialUrl: String = "") {
         previousLoadUrl = if (previous.isNotEmpty() && !previousReady && !sameUrl(previous, result.sourceUrl)) previous else ""
     }
 
+    LaunchedEffect(document?.sourceUrl, document?.isCatalog) {
+        document?.takeUnless { it.isCatalog }?.let { restored ->
+            preparePrevious(restored)
+            prepareNext(restored)
+        }
+    }
+
     fun catalogPageKey(url: String): String = cacheKey(normalizeUrl(url))
 
     fun nextCatalogPage(catalog: ReaderDocument, loaded: Set<String>): String? =
