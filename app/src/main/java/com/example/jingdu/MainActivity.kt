@@ -1083,6 +1083,21 @@ private fun JingduApp(initialUrl: String = "") {
             pendingAutoNext = true
             return
         }
+        val cachedNext = findCached(nextUrl)
+        val nextPagePending = cachedNext != null && !cachedNext.isCatalog &&
+            uncachedPageContinuationUrl(cachedNext) != null
+        if (nextPagePending) {
+            prepareNext(current)
+            pendingAutoNext = true
+            return
+        }
+        if (cachedNext == null && !sameUrl(prefetchLoadUrl, nextUrl)) {
+            prepareNext(current)
+        }
+        if (cachedNext == null && sameUrl(prefetchLoadUrl, nextUrl)) {
+            pendingAutoNext = true
+            return
+        }
         pendingAutoNext = false
         openChapter(nextUrl, ChapterOpenPosition.START)
     }
@@ -1100,7 +1115,20 @@ private fun JingduApp(initialUrl: String = "") {
                 prefetchPageBaseUrl = ""
                 cacheDocument(merged, base.sourceUrl)
                 cacheDocument(merged, expected)
-                if (document?.sourceUrl?.let { sameUrl(it, base.sourceUrl) } == true) {
+                val pending = pendingChapterNavigation
+                if (pending != null && sameUrl(pending.url, base.sourceUrl)) {
+                    pendingChapterNavigation = null
+                    showDocument(
+                        merged,
+                        pending.url,
+                        pending.position,
+                        pending.catalogUrl,
+                        pending.catalogIndex,
+                        pending.verticalIndex,
+                        pending.verticalOffset,
+                        loadActiveWebView = false
+                    )
+                } else if (document?.sourceUrl?.let { sameUrl(it, base.sourceUrl) } == true) {
                     document = merged
                     currentUrl = merged.sourceUrl
                     address = merged.sourceUrl
@@ -1109,8 +1137,8 @@ private fun JingduApp(initialUrl: String = "") {
                     pruneCache(merged, previousDocument)
                     preparePrevious(merged)
                     prepareNext(merged)
-                 } else {
-                     prepareNext(merged)
+                } else if (uncachedPageContinuationUrl(merged) != null) {
+                    prepareNext(merged)
                 }
                 return
             }
@@ -1118,6 +1146,10 @@ private fun JingduApp(initialUrl: String = "") {
         }
 
         cacheDocument(result, expected)
+        if (uncachedPageContinuationUrl(result) != null) {
+            prepareNext(result)
+            return
+        }
         val pending = pendingChapterNavigation
         if (pending != null && sameUrl(pending.url, expected)) {
             pendingChapterNavigation = null
@@ -1388,7 +1420,8 @@ private fun JingduApp(initialUrl: String = "") {
         document?.paragraphs?.size,
         document?.navigation?.next?.href,
         document?.navigation?.nextPage?.href,
-        prefetchLoadUrl
+        prefetchLoadUrl,
+        cachedDocuments
     ) {
         if (!pendingAutoNext) return@LaunchedEffect
         val current = document ?: return@LaunchedEffect
@@ -1398,6 +1431,17 @@ private fun JingduApp(initialUrl: String = "") {
             pendingAutoNext = false
             return@LaunchedEffect
         }
+        val cachedNext = findCached(nextUrl)
+        val nextPagePending = cachedNext != null && !cachedNext.isCatalog &&
+            uncachedPageContinuationUrl(cachedNext) != null
+        if (nextPagePending) {
+            prepareNext(current)
+            return@LaunchedEffect
+        }
+        if (cachedNext == null && !sameUrl(prefetchLoadUrl, nextUrl)) {
+            prepareNext(current)
+        }
+        if (cachedNext == null && sameUrl(prefetchLoadUrl, nextUrl)) return@LaunchedEffect
         pendingAutoNext = false
         openChapter(nextUrl, ChapterOpenPosition.START)
     }
