@@ -1441,7 +1441,12 @@ private fun JingduApp(initialUrl: String = "") {
     )
 
     JingduTheme(settings.theme) {
-        Box(modifier = Modifier.fillMaxSize().background(IvoryPalette.background)) {
+        val windowBackground = if (screen == AppScreen.READER.name) {
+            paletteFor(settings.theme).background
+        } else {
+            IvoryPalette.background
+        }
+        Box(modifier = Modifier.fillMaxSize().background(windowBackground)) {
             key(activeWebViewGeneration) {
                 AndroidView(
                     modifier = Modifier.size(1.dp).alpha(0f),
