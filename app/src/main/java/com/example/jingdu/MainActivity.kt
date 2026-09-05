@@ -1585,10 +1585,24 @@ private fun JingduApp(initialUrl: String = "") {
                     catalogError = catalogErrorMessage,
                     isInBookshelf = currentBookInShelf,
                     onAddToBookshelf = { addCurrentBookToShelf() },
-                    onSettingsChange = {
-                        settings = it
-                        saveSettings(preferences, it)
-                        activity?.requestedOrientation = it.screenOrientation.toRequestedOrientation()
+                    onSettingsChange = { updatedSettings ->
+                        if (updatedSettings.pageMode != settings.pageMode) {
+                             document?.sourceUrl?.let { sourceUrl ->
+                                 val latestOffset = savedReadingOffset(sourceUrl) ?: readingOffset
+                                 if (latestOffset != null) {
+                                     preferences.edit()
+                                         .putInt(progressOffsetKey(sourceUrl), latestOffset)
+                                         .apply()
+                                 }
+                             }
+                         readingOffset = null
+                         chapterOpenPosition = null
+                             verticalOpenIndex = null
+                             verticalOpenOffset = null
+                         }
+                         settings = updatedSettings
+                        saveSettings(preferences, updatedSettings)
+                        activity?.requestedOrientation = updatedSettings.screenOrientation.toRequestedOrientation()
                     },
                     onPositionChange = { sourceUrl, offset ->
                          if (document?.sourceUrl?.let { current -> sameUrl(current, sourceUrl) } == true) {
@@ -2902,6 +2916,7 @@ private fun VerticalChapterView(
     val preferences = remember { context.getSharedPreferences("jingdu", 0) }
     val currentParagraphOffsets = remember(document.sourceUrl, document.paragraphs) { paragraphStartOffsets(document) }
     var positionRestored by remember(document.sourceUrl) { mutableStateOf(false) }
+    var skipInitialPositionSave by remember(document.sourceUrl) { mutableStateOf(false) }
     val previousItemCount = previousChapter?.let { it.paragraphs.size + 1 } ?: 0
     val currentStartIndex = previousItemCount
     val currentEndIndex = currentStartIndex + document.paragraphs.size
@@ -2912,9 +2927,10 @@ private fun VerticalChapterView(
 
     LaunchedEffect(document.sourceUrl, chapterOpenPosition, verticalOpenIndex, verticalOpenOffset) {
         positionRestored = false
+        skipInitialPositionSave = true
         val saved = preferences.getInt(progressKey(document.sourceUrl), 0)
         val savedOffset = preferences.getInt(progressOffsetKey(document.sourceUrl), -1)
-        val anchorOffset = readingOffset ?: savedOffset.takeIf { it >= 0 }
+        val anchorOffset = savedOffset.takeIf { it >= 0 } ?: readingOffset
         val hasContinuationPosition = chapterOpenPosition == null && verticalOpenIndex != null
         val relativeIndex = if (hasContinuationPosition) {
             verticalOpenIndex.coerceIn(0, document.paragraphs.size)
@@ -2931,12 +2947,21 @@ private fun VerticalChapterView(
         }
         val target = currentStartIndex + relativeIndex
         val offset = if (hasContinuationPosition) verticalOpenOffset?.coerceAtLeast(0) ?: 0 else 0
+        val boundedTarget = target.coerceIn(0, max(0, totalItemCount - 1))
         suppressBoundaryNavigation = true
         var restored = false
         try {
-            listState.scrollToItem(target.coerceIn(0, max(0, totalItemCount - 1)), offset)
-            delay(50)
-            restored = true
+            for (attempt in 0 until 8) {
+                listState.scrollToItem(boundedTarget, offset)
+                delay(40)
+                val layout = listState.layoutInfo
+                val targetVisible = layout.visibleItemsInfo.any { it.index == boundedTarget }
+                val atEnd = !listState.canScrollForward && layout.visibleItemsInfo.lastOrNull()?.index == boundedTarget
+                if (listState.firstVisibleItemIndex == boundedTarget || (targetVisible && atEnd)) {
+                    restored = true
+                    break
+                }
+            }
         } finally {
             suppressBoundaryNavigation = false
             if (restored) positionRestored = true
@@ -2967,6 +2992,10 @@ private fun VerticalChapterView(
                 if (!restored || suppressed || scrolling) return@collectLatest
                 delay(120)
                 if (!positionRestored || suppressBoundaryNavigation || listState.isScrollInProgress) {
+                    return@collectLatest
+                }
+                if (skipInitialPositionSave) {
+                    skipInitialPositionSave = false
                     return@collectLatest
                 }
                 val index = listState.firstVisibleItemIndex
@@ -3173,7 +3202,7 @@ private fun HorizontalChapterView(
             positionRestored = false
             val savedPage = preferences.getInt(horizontalProgressKey, 0)
             val savedOffset = preferences.getInt(offsetKey, -1)
-            val anchorOffset = readingOffset ?: savedOffset.takeIf { it >= 0 }
+            val anchorOffset = savedOffset.takeIf { it >= 0 } ?: readingOffset
             val target = when (chapterOpenPosition) {
                 ChapterOpenPosition.START -> 0
                 ChapterOpenPosition.END -> pages.lastIndex
