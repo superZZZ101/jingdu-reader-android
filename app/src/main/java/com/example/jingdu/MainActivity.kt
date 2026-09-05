@@ -3550,6 +3550,7 @@ private fun HorizontalChapterView(
 private val HorizontalPageHorizontalPadding = 22.dp
 private val HorizontalPageTopPadding = 64.dp
 private val HorizontalPageBottomPadding = 52.dp
+private val HorizontalPageTextBottomSafety = 12.dp
 
 private fun horizontalHeaderHeightPx(
     document: ReaderDocument,
@@ -3612,7 +3613,9 @@ private fun HorizontalChapterPage(
         }
         Text(
             text = text.ifEmpty { " " },
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = HorizontalPageTextBottomSafety),
             color = palette.ink,
             fontSize = settings.fontSize.sp,
             lineHeight = (settings.fontSize * settings.lineHeight).sp,
@@ -3636,7 +3639,9 @@ private fun paginateChapterPages(
         fontFamily = FontFamily.Serif
     )
     val fullText = document.paragraphs.joinToString("\n\n").trim()
-    val textSafetyPx = with(density) { 1.dp.toPx().toInt().coerceAtLeast(1) }
+    val textSafetyPx = with(density) {
+        HorizontalPageTextBottomSafety.toPx().toInt().coerceAtLeast(1)
+    }
     val firstHeight = (contentHeightPx - headerHeightPx - textSafetyPx).coerceAtLeast(1)
     val normalHeight = (contentHeightPx - textSafetyPx).coerceAtLeast(1)
     val pages = mutableListOf<ChapterPage>()
