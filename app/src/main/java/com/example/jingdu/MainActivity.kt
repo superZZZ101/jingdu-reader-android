@@ -421,6 +421,7 @@ private fun JingduApp(initialUrl: String = "") {
     var previousWebViewGeneration by remember { mutableStateOf(0) }
     var catalogWebViewGeneration by remember { mutableStateOf(0) }
     var activeLoadUrl by rememberSaveable { mutableStateOf("") }
+    var activeRequestId by remember { mutableStateOf(0L) }
     var prefetchLoadUrl by remember { mutableStateOf("") }
     var prefetchRequestId by remember { mutableStateOf(0L) }
     var previousLoadUrl by remember { mutableStateOf("") }
@@ -520,6 +521,7 @@ private fun JingduApp(initialUrl: String = "") {
         activeWebView?.stopLoading()
         activeWebView = null
         activeWebViewGeneration += 1
+        activeRequestId += 1
     }
 
     fun restartPrefetchWebView() {
@@ -572,6 +574,9 @@ private fun JingduApp(initialUrl: String = "") {
             if (prefetchPageBaseUrl.isNotEmpty() || prefetchLoadUrl.isNotEmpty() || prefetchWebView != null) {
                 restartPrefetchWebView()
             }
+            prefetchRetryUrl = ""
+            prefetchRetryCount = 0
+            prefetchRetryScheduled = false
         }
         prefetchPageBaseUrl = baseUrl
         prefetchLoadUrl = targetUrl
@@ -945,6 +950,7 @@ private fun JingduApp(initialUrl: String = "") {
             recordDiagnostic("invalid_url", raw, "normalize_failed")
             return
         }
+        pendingAutoNext = false
         preferences.edit().putString("last_url", normalized).apply()
         screen = AppScreen.READER.name
         if (catalogContext != null) activeCatalogUrl = catalogContext
@@ -1102,6 +1108,14 @@ private fun JingduApp(initialUrl: String = "") {
         openChapter(nextUrl, ChapterOpenPosition.START)
     }
 
+    fun failPendingAutoNext(target: String, reason: String) {
+        if (!pendingAutoNext) return
+        pendingAutoNext = false
+        loading = false
+        errorMessage = "下一章暂时无法预读取，请点击重试"
+        recordDiagnostic("auto_next_prefetch_failed", target, reason)
+    }
+
     fun handlePrefetchedChapter(result: ReaderDocument, expected: String) {
         restartPrefetchWebView()
         if (sameUrl(prefetchLoadUrl, expected)) prefetchLoadUrl = ""
@@ -1185,6 +1199,7 @@ private fun JingduApp(initialUrl: String = "") {
             val failedUrl = activeLoadUrl
             val failedView = view
             val failedToken = requestToken
+            val failedRequestId = activeRequestId
             recordDiagnostic(
                 "active_load_error",
                 failedUrl,
@@ -1202,6 +1217,7 @@ private fun JingduApp(initialUrl: String = "") {
                 errorMessage = null
                 val retryDelay = 700L * activeRetryCount
                 failedView.postDelayed({
+                    if (activeRequestId != failedRequestId) return@postDelayed
                     activeRetryScheduled = false
                     if (activeWebView === failedView &&
                         webViewLoadToken(failedView) == failedToken &&
@@ -1274,6 +1290,7 @@ private fun JingduApp(initialUrl: String = "") {
             val failedUrl = prefetchLoadUrl
             val failedView = view
             val failedToken = requestToken
+            val failedRequestId = prefetchRequestId
             recordDiagnostic(
                 "prefetch_load_error",
                 failedUrl,
@@ -1289,6 +1306,7 @@ private fun JingduApp(initialUrl: String = "") {
                 prefetchRetryScheduled = true
                 val retryDelay = 900L * prefetchRetryCount
                 failedView.postDelayed({
+                    if (prefetchRequestId != failedRequestId) return@postDelayed
                     prefetchRetryScheduled = false
                     if (prefetchWebView === failedView &&
                         webViewLoadToken(failedView) == failedToken &&
@@ -1303,6 +1321,7 @@ private fun JingduApp(initialUrl: String = "") {
                 prefetchRetryUrl = ""
                 prefetchRetryCount = 0
                 fallbackPendingChapterToActive(failedUrl)
+                failPendingAutoNext(failedUrl, "retry_exhausted")
             }
         }
     }
@@ -1476,18 +1495,31 @@ private fun JingduApp(initialUrl: String = "") {
             }
         }
     }
-    LaunchedEffect(prefetchLoadUrl, prefetchRequestId) {
+    LaunchedEffect(
+        prefetchLoadUrl,
+        prefetchRequestId,
+        prefetchPageBaseUrl,
+        pendingChapterNavigation?.url,
+        pendingAutoNext
+    ) {
         val target = prefetchLoadUrl
         val requestId = prefetchRequestId
+        val baseUrl = prefetchPageBaseUrl
+        val pendingUrl = pendingChapterNavigation?.url
+        val waitingForAutoNext = pendingAutoNext
         if (target.isEmpty()) return@LaunchedEffect
         delay(20_000)
-        if (prefetchRequestId != requestId || !sameUrl(prefetchLoadUrl, target)) return@LaunchedEffect
-        val pending = pendingChapterNavigation
-        val waitingForTarget = pending != null && sameUrl(pending.url, target)
+        if (prefetchRequestId != requestId ||
+            !sameUrl(prefetchLoadUrl, target) ||
+            prefetchPageBaseUrl != baseUrl ||
+            pendingChapterNavigation?.url != pendingUrl ||
+            pendingAutoNext != waitingForAutoNext
+        ) return@LaunchedEffect
+        val waitingForTarget = pendingUrl != null && sameUrl(pendingUrl, target)
         recordDiagnostic(
             "prefetch_timeout",
             target,
-            "pending=$waitingForTarget base=$prefetchPageBaseUrl"
+            "pending=$waitingForTarget auto=$waitingForAutoNext base=$baseUrl"
         )
         prefetchLoadUrl = ""
         prefetchPageBaseUrl = ""
@@ -1496,6 +1528,7 @@ private fun JingduApp(initialUrl: String = "") {
         prefetchRetryScheduled = false
         restartPrefetchWebView()
         if (waitingForTarget) fallbackPendingChapterToActive(target)
+        if (waitingForAutoNext) failPendingAutoNext(target, "timeout")
     }
     LaunchedEffect(previousWebView, previousLoadUrl) {
         val target = previousLoadUrl
@@ -1512,15 +1545,26 @@ private fun JingduApp(initialUrl: String = "") {
             }
         }
     }
-    LaunchedEffect(previousLoadUrl, previousRequestId) {
+    LaunchedEffect(
+        previousLoadUrl,
+        previousRequestId,
+        previousPageBaseUrl,
+        pendingChapterNavigation?.url
+    ) {
         val target = previousLoadUrl
         val requestId = previousRequestId
+        val baseUrl = previousPageBaseUrl
+        val pendingUrl = pendingChapterNavigation?.url
         if (target.isEmpty()) return@LaunchedEffect
         delay(20_000)
-        if (previousRequestId != requestId || !sameUrl(previousLoadUrl, target)) return@LaunchedEffect
+        if (previousRequestId != requestId ||
+            !sameUrl(previousLoadUrl, target) ||
+            previousPageBaseUrl != baseUrl ||
+            pendingChapterNavigation?.url != pendingUrl
+        ) return@LaunchedEffect
         val pending = pendingChapterNavigation
-        val fallbackTarget = pending?.url?.takeIf {
-            sameUrl(it, target) || (previousPageBaseUrl.isNotEmpty() && sameUrl(it, previousPageBaseUrl))
+        val fallbackTarget = pendingUrl?.takeIf {
+            sameUrl(it, target) || (baseUrl.isNotEmpty() && sameUrl(it, baseUrl))
         }
         recordDiagnostic(
             "previous_timeout",
@@ -1656,11 +1700,17 @@ private fun JingduApp(initialUrl: String = "") {
                 val previousChapter = document?.navigation?.previous?.href
                     ?.let(::normalizeUrl)
                     ?.let(::findCached)
-                    ?.takeIf { cached -> cached.isUsableForReading() && !cached.isCatalog }
+                    ?.let(::mergeCachedContinuation)
+                    ?.takeIf { cached ->
+                        cached.isUsableForReading() &&
+                            !cached.isCatalog &&
+                            !hasUncachedPageContinuation(cached)
+                    }
                     ?.takeUnless { cached -> sameUrl(cached.sourceUrl, currentSourceUrl) }
                 val nextChapter = document?.navigation?.next?.href
                     ?.let(::normalizeUrl)
                     ?.let(::findCached)
+                    ?.let(::mergeCachedContinuation)
                     ?.takeIf { cached ->
                         cached.isUsableForReading() &&
                             !cached.isCatalog &&
@@ -3411,7 +3461,6 @@ private fun HorizontalChapterView(
                     val enteredNextContent = showNextContent && page >= pages.size
                     val reachedCurrentEnd = !showNextContent && page >= pages.lastIndex
                     if (!enteredNextContent && !reachedCurrentEnd) {
-                        lastHandledUserGesture = generation
                         return@collectLatest
                     }
                     lastHandledUserGesture = generation
