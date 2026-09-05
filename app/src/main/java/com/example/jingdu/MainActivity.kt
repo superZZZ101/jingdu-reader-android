@@ -3688,8 +3688,64 @@ private fun paginateChapterPages(
         firstPage = false
     }
     if (pages.isEmpty()) pages += ChapterPage("", 0)
+    rebalanceTrailingSparsePage(
+        pages = pages,
+        textMeasurer = textMeasurer,
+        style = style,
+        contentWidthPx = contentWidthPx,
+        contentHeightPx = normalHeight
+    )
 
     return pages
+}
+
+private const val TrailingSparsePageMaxCharacters = 48
+private const val TrailingPageMinimumCharacters = 48
+
+private fun rebalanceTrailingSparsePage(
+    pages: MutableList<ChapterPage>,
+    textMeasurer: TextMeasurer,
+    style: TextStyle,
+    contentWidthPx: Int,
+    contentHeightPx: Int
+) {
+    if (pages.size < 2) return
+    val lastIndex = pages.lastIndex
+    val trailing = pages[lastIndex]
+    val trailingLength = trailing.text.count { !it.isWhitespace() }
+    if (trailingLength == 0 || trailingLength > TrailingSparsePageMaxCharacters) return
+
+    val previous = pages[lastIndex - 1]
+    val previousText = previous.text
+    if (previousText.isBlank()) return
+    for (targetCharacters in listOf(TrailingPageMinimumCharacters, 32, 20, 12)) {
+        val minimumMoved = (targetCharacters - trailingLength).coerceAtLeast(1)
+        val idealStart = (previousText.length - minimumMoved).coerceAtLeast(1)
+        val earliestStart = (previousText.length - 240).coerceAtLeast(1)
+        val candidateStarts = linkedSetOf<Int>()
+        candidateStarts += idealStart
+        for (start in (idealStart - 1) downTo earliestStart) {
+            if (previousText[start - 1] in "\n。！？；：.!?;:") candidateStarts += start
+        }
+
+        for (start in candidateStarts.sortedDescending()) {
+            var adjustedStart = start
+            while (adjustedStart > 1 && previousText[adjustedStart] in "，。！？；：、.!?;:)]}》」』”’") {
+                adjustedStart -= 1
+            }
+            val kept = previousText.substring(0, adjustedStart).trimEnd()
+            val moved = previousText.substring(adjustedStart).trimStart()
+            val combined = moved + trailing.text
+            if (kept.isBlank() || combined.count { !it.isWhitespace() } < targetCharacters) continue
+            if (fitTextPrefix(combined, textMeasurer, style, contentWidthPx, contentHeightPx) < combined.length) continue
+            pages[lastIndex - 1] = previous.copy(text = kept)
+            pages[lastIndex] = trailing.copy(
+                text = combined,
+                startOffset = previous.startOffset + adjustedStart
+            )
+            return
+        }
+    }
 }
 
 private fun appendFullPages(
