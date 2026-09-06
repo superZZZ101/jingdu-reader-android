@@ -3688,64 +3688,110 @@ private fun paginateChapterPages(
         firstPage = false
     }
     if (pages.isEmpty()) pages += ChapterPage("", 0)
-    rebalanceTrailingSparsePage(
+    rebalanceTrailingSparsePages(
         pages = pages,
         textMeasurer = textMeasurer,
         style = style,
         contentWidthPx = contentWidthPx,
-        contentHeightPx = normalHeight
+        firstPageHeightPx = firstHeight,
+        normalPageHeightPx = normalHeight
     )
 
     return pages
 }
 
-private const val TrailingSparsePageMaxCharacters = 48
-private const val TrailingPageMinimumCharacters = 48
+private const val TrailingRebalanceMaxPages = 4
+private const val TrailingRebalanceHeightFraction = 0.60f
+private const val TrailingRebalanceBacktrackCharacters = 0
 
-private fun rebalanceTrailingSparsePage(
+private fun rebalanceTrailingSparsePages(
     pages: MutableList<ChapterPage>,
     textMeasurer: TextMeasurer,
     style: TextStyle,
     contentWidthPx: Int,
-    contentHeightPx: Int
+    firstPageHeightPx: Int,
+    normalPageHeightPx: Int
 ) {
     if (pages.size < 2) return
     val lastIndex = pages.lastIndex
-    val trailing = pages[lastIndex]
-    val trailingLength = trailing.text.count { !it.isWhitespace() }
-    if (trailingLength == 0 || trailingLength > TrailingSparsePageMaxCharacters) return
+    fun pageHeight(index: Int): Int = textMeasurer.measure(
+        text = AnnotatedString(pages[index].text.ifEmpty { " " }),
+        style = style,
+        overflow = TextOverflow.Clip,
+        softWrap = true,
+        maxLines = Int.MAX_VALUE,
+        constraints = Constraints(maxWidth = contentWidthPx.coerceAtLeast(1))
+    ).size.height
+    fun availableHeight(index: Int): Int =
+        if (index == 0) firstPageHeightPx else normalPageHeightPx
+    fun isSparse(index: Int): Boolean =
+        pageHeight(index) < (availableHeight(index) * TrailingRebalanceHeightFraction).toInt()
 
-    val previous = pages[lastIndex - 1]
-    val previousText = previous.text
-    if (previousText.isBlank()) return
-    for (targetCharacters in listOf(TrailingPageMinimumCharacters, 32, 20, 12)) {
-        val minimumMoved = (targetCharacters - trailingLength).coerceAtLeast(1)
-        val idealStart = (previousText.length - minimumMoved).coerceAtLeast(1)
-        val earliestStart = (previousText.length - 240).coerceAtLeast(1)
-        val candidateStarts = linkedSetOf<Int>()
-        candidateStarts += idealStart
-        for (start in (idealStart - 1) downTo earliestStart) {
-            if (previousText[start - 1] in "\n。！？；：.!?;:") candidateStarts += start
-        }
-
-        for (start in candidateStarts.sortedDescending()) {
-            var adjustedStart = start
-            while (adjustedStart > 1 && previousText[adjustedStart] in "，。！？；：、.!?;:)]}》」』”’") {
-                adjustedStart -= 1
-            }
-            val kept = previousText.substring(0, adjustedStart).trimEnd()
-            val moved = previousText.substring(adjustedStart).trimStart()
-            val combined = moved + trailing.text
-            if (kept.isBlank() || combined.count { !it.isWhitespace() } < targetCharacters) continue
-            if (fitTextPrefix(combined, textMeasurer, style, contentWidthPx, contentHeightPx) < combined.length) continue
-            pages[lastIndex - 1] = previous.copy(text = kept)
-            pages[lastIndex] = trailing.copy(
-                text = combined,
-                startOffset = previous.startOffset + adjustedStart
-            )
-            return
-        }
+    if (!isSparse(lastIndex)) return
+    var firstTailIndex = (lastIndex - 1).coerceAtLeast(0)
+    while (
+        firstTailIndex > 0 &&
+        lastIndex - firstTailIndex + 1 < TrailingRebalanceMaxPages &&
+        isSparse(firstTailIndex - 1)
+    ) {
+        firstTailIndex -= 1
     }
+    if (firstTailIndex == 0 && pages.size > TrailingRebalanceMaxPages) return
+
+    val oldTailPageCount = lastIndex - firstTailIndex + 1
+    val combinedText = pages.subList(firstTailIndex, pages.size)
+        .joinToString(separator = "") { it.text }
+        .trim()
+    if (combinedText.isEmpty()) return
+
+    fun tryReflow(targetPageCount: Int, minimumPageCharacters: Int): List<ChapterPage>? {
+        val reflowed = mutableListOf<ChapterPage>()
+        var remainder = combinedText
+        var consumed = 0
+        for (localPage in 0 until targetPageCount) {
+            if (remainder.isEmpty()) return null
+            val absolutePage = firstTailIndex + localPage
+            val availableHeight = availableHeight(absolutePage)
+            val fit = fitTextPrefix(remainder, textMeasurer, style, contentWidthPx, availableHeight)
+            val remainingPageCount = targetPageCount - localPage - 1
+            val maxLength = if (remainingPageCount == 0) {
+                fit
+            } else {
+                minOf(fit, remainder.length - minimumPageCharacters * remainingPageCount)
+            }
+            if (maxLength < 1) return null
+            val (pageText, rest) = splitTextAtBoundary(
+                remainder,
+                maxLength,
+                maxBacktrackCharacters = TrailingRebalanceBacktrackCharacters
+            )
+            if (pageText.isBlank() || fitTextPrefix(pageText, textMeasurer, style, contentWidthPx, availableHeight) < pageText.length) {
+                return null
+            }
+            reflowed += ChapterPage(
+                text = pageText,
+                startOffset = pages[firstTailIndex].startOffset + consumed
+            )
+            consumed += remainder.length - rest.length
+            remainder = rest
+        }
+        return reflowed.takeIf { remainder.isEmpty() }
+    }
+
+    val minimumCharacterTargets = listOf(64, 48, 32, 20, 12, 1)
+    var reflowed: List<ChapterPage>? = null
+    for (targetPageCount in 1..oldTailPageCount) {
+        val targets = if (targetPageCount == 1) listOf(0) else minimumCharacterTargets
+        for (minimumPageCharacters in targets) {
+            reflowed = tryReflow(targetPageCount, minimumPageCharacters)
+            if (reflowed != null) break
+        }
+        if (reflowed != null) break
+    }
+    if (reflowed == null) return
+
+    pages.subList(firstTailIndex, pages.size).clear()
+    pages.addAll(reflowed)
 }
 
 private fun appendFullPages(
@@ -3798,10 +3844,18 @@ private fun fitTextPrefix(
     return best.coerceAtMost(text.length)
 }
 
-private fun splitTextAtBoundary(text: String, requestedLength: Int): Pair<String, String> {
+private fun splitTextAtBoundary(
+    text: String,
+    requestedLength: Int,
+    maxBacktrackCharacters: Int = 180
+): Pair<String, String> {
     if (text.isEmpty()) return "" to ""
     var cut = requestedLength.coerceIn(1, text.length)
-    val searchStart = (cut - 180).coerceAtLeast(1)
+    val searchStart = if (maxBacktrackCharacters <= 0) {
+        cut
+    } else {
+        (cut - maxBacktrackCharacters).coerceAtLeast(1)
+    }
     val newline = text.lastIndexOf('\n', cut - 1)
     if (newline >= searchStart) {
         cut = newline
