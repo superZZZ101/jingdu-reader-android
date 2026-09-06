@@ -3870,7 +3870,7 @@ private fun fitTextPrefix(
 private fun splitTextAtBoundary(
     text: String,
     requestedLength: Int,
-    maxBacktrackCharacters: Int = 180
+    maxBacktrackCharacters: Int = 48
 ): Pair<String, String> {
     if (text.isEmpty()) return "" to ""
     var cut = requestedLength.coerceIn(1, text.length)
