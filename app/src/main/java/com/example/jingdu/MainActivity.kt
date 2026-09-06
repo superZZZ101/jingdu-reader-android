@@ -3579,7 +3579,7 @@ private fun HorizontalChapterView(
 private val HorizontalPageHorizontalPadding = 22.dp
 private val HorizontalPageTopPadding = 64.dp
 private val HorizontalPageBottomPadding = 52.dp
-private val HorizontalPageTextBottomSafety = 12.dp
+private val HorizontalPageTextBottomSafety = 24.dp
 
 private fun horizontalHeaderHeightPx(
     document: ReaderDocument,
@@ -3829,6 +3829,29 @@ private fun fitTextPrefix(
     ).didOverflowHeight
 
     if (fits(text.length)) return text.length
+
+    // Use the last complete visual line so a page never ends halfway through a line.
+    val fullLayout = textMeasurer.measure(
+        text = AnnotatedString(text),
+        style = style,
+        overflow = TextOverflow.Clip,
+        softWrap = true,
+        maxLines = Int.MAX_VALUE,
+        constraints = Constraints(maxWidth = widthPx.coerceAtLeast(1))
+    )
+    var lastFittingLine = -1
+    for (line in 0 until fullLayout.lineCount) {
+        if (fullLayout.getLineBottom(line) <= heightPx) {
+            lastFittingLine = line
+        } else {
+            break
+        }
+    }
+    if (lastFittingLine >= 0) {
+        return fullLayout.getLineEnd(lastFittingLine, visibleEnd = true)
+            .coerceIn(1, text.length)
+    }
+
     var low = 1
     var high = text.length
     var best = 1
