@@ -3384,7 +3384,7 @@ private fun HorizontalChapterView(
             contentHeightPx,
             headerHeightPx
         ) {
-            paginateChapterPages(document, textMeasurer, contentWidthPx, contentHeightPx, headerHeightPx, settings)
+            paginateChapterPages(document, textMeasurer, density, contentWidthPx, contentHeightPx, headerHeightPx, settings)
         }
         val hasNextChapter = document.navigation.next != null
         val nextPages = remember(
@@ -3398,7 +3398,7 @@ private fun HorizontalChapterView(
         ) {
             nextChapter
                 ?.takeIf { nextChapterReady && !it.isCatalog && it.paragraphs.isNotEmpty() }
-                ?.let { paginateChapterPages(it, textMeasurer, contentWidthPx, contentHeightPx, nextHeaderHeightPx, settings) }
+                ?.let { paginateChapterPages(it, textMeasurer, density, contentWidthPx, contentHeightPx, nextHeaderHeightPx, settings) }
                 .orEmpty()
         }
         val showNextContent = hasNextChapter && nextPages.isNotEmpty()
@@ -3579,6 +3579,7 @@ private fun HorizontalChapterView(
 private val HorizontalPageHorizontalPadding = 22.dp
 private val HorizontalPageTopPadding = 64.dp
 private val HorizontalPageBottomPadding = 52.dp
+private val HorizontalPageTextBottomSafety = 1.dp
 
 private fun horizontalHeaderHeightPx(
     document: ReaderDocument,
@@ -3641,7 +3642,9 @@ private fun HorizontalChapterPage(
         }
         Text(
             text = text.ifEmpty { " " },
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = HorizontalPageTextBottomSafety),
             color = palette.ink,
             fontSize = settings.fontSize.sp,
             lineHeight = (settings.fontSize * settings.lineHeight).sp,
@@ -3653,6 +3656,7 @@ private fun HorizontalChapterPage(
 private fun paginateChapterPages(
     document: ReaderDocument,
     textMeasurer: TextMeasurer,
+    density: Density,
     contentWidthPx: Int,
     contentHeightPx: Int,
     headerHeightPx: Int,
@@ -3664,8 +3668,11 @@ private fun paginateChapterPages(
         fontFamily = FontFamily.Serif
     )
     val fullText = document.paragraphs.joinToString("\n\n").trim()
-    val firstHeight = (contentHeightPx - headerHeightPx).coerceAtLeast(1)
-    val normalHeight = contentHeightPx.coerceAtLeast(1)
+    val textSafetyPx = with(density) {
+        HorizontalPageTextBottomSafety.toPx().toInt().coerceAtLeast(1)
+    }
+    val firstHeight = (contentHeightPx - headerHeightPx - textSafetyPx).coerceAtLeast(1)
+    val normalHeight = (contentHeightPx - textSafetyPx).coerceAtLeast(1)
     val pages = mutableListOf<ChapterPage>()
     var remainder = fullText
     var firstPage = true
