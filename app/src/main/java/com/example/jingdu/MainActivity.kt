@@ -82,6 +82,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberUpdatedState
@@ -181,6 +182,37 @@ private data class PendingChapterNavigation(
     val catalogIndex: Int?,
     val verticalIndex: Int?,
     val verticalOffset: Int?
+)
+
+private val PendingChapterNavigationSaver = Saver<PendingChapterNavigation?, Any>(
+    save = { pending ->
+        pending?.let {
+            listOf(
+                it.url,
+                it.position?.name,
+                it.catalogUrl,
+                it.catalogIndex,
+                it.verticalIndex,
+                it.verticalOffset
+            )
+        }
+    },
+    restore = { saved ->
+        val values = saved as? List<*> ?: return@Saver null
+        val url = values.getOrNull(0) as? String ?: return@Saver null
+        if (url.isBlank()) return@Saver null
+        val position = (values.getOrNull(1) as? String)?.let { value ->
+            runCatching { ChapterOpenPosition.valueOf(value) }.getOrNull()
+        }
+        PendingChapterNavigation(
+            url = url,
+            position = position,
+            catalogUrl = values.getOrNull(2) as? String,
+            catalogIndex = values.getOrNull(3) as? Int,
+            verticalIndex = values.getOrNull(4) as? Int,
+            verticalOffset = values.getOrNull(5) as? Int
+        )
+    }
 )
 
 private data class ChapterPage(
@@ -480,7 +512,9 @@ private fun JingduApp(initialUrl: String = "") {
     var verticalOpenIndex by remember { mutableStateOf<Int?>(null) }
     var verticalOpenOffset by remember { mutableStateOf<Int?>(null) }
     var readingOffset by remember { mutableStateOf<Int?>(null) }
-    var pendingChapterNavigation by remember { mutableStateOf<PendingChapterNavigation?>(null) }
+    var pendingChapterNavigation by rememberSaveable(
+        stateSaver = PendingChapterNavigationSaver
+    ) { mutableStateOf<PendingChapterNavigation?>(null) }
     var pendingAutoNext by remember { mutableStateOf(false) }
     var prefetchPageBaseUrl by remember { mutableStateOf("") }
     var previousPageBaseUrl by remember { mutableStateOf("") }
@@ -579,6 +613,30 @@ private fun JingduApp(initialUrl: String = "") {
         catalogWebView?.stopLoading()
         catalogWebView = null
         catalogWebViewGeneration += 1
+    }
+
+    fun cancelReaderChapterLoads() {
+        pendingChapterNavigation = null
+        pendingAutoNext = false
+        chapterNavigationTarget = ""
+        activeLoadUrl = ""
+        activeRetryUrl = ""
+        activeRetryCount = 0
+        activeRetryScheduled = false
+        prefetchLoadUrl = ""
+        prefetchPageBaseUrl = ""
+        prefetchRetryUrl = ""
+        prefetchRetryCount = 0
+        prefetchRetryScheduled = false
+        previousLoadUrl = ""
+        previousPageBaseUrl = ""
+        loading = false
+        errorMessage = null
+        clearCloudflareChallenge()
+        restartActiveWebView()
+        restartPrefetchWebView()
+        restartPreviousWebView()
+        restartCatalogWebView()
     }
 
     fun findCached(url: String): ReaderDocument? {
@@ -1251,7 +1309,8 @@ private fun JingduApp(initialUrl: String = "") {
     }
 
     fun handleActiveError(view: WebView, requestToken: Long, pageUrl: String, reason: String) {
-        if (view === activeWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
+        if (screen == AppScreen.READER.name &&
+            view === activeWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
             activeLoadUrl.isNotEmpty() && sameReaderLoadUrl(pageUrl, activeLoadUrl)) {
             if (isCloudflareChallengeReason(reason)) {
                 claimCloudflareChallenge(view, pageUrl, "active", requestToken, preferActive = true)
@@ -1300,7 +1359,8 @@ private fun JingduApp(initialUrl: String = "") {
         var accepted = false
         val expected = activeLoadUrl
         val result = parseReaderPayload(rawPayload)
-        val tokenMatches = view === activeWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
+        val tokenMatches = screen == AppScreen.READER.name &&
+            view === activeWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
         val matches = expected.isNotEmpty() && tokenMatches &&
             (sameReaderLoadUrl(pageUrl, expected) || (result != null && sameReaderLoadUrl(result.sourceUrl, expected)))
         if (matches) {
@@ -1334,7 +1394,8 @@ private fun JingduApp(initialUrl: String = "") {
         var accepted = false
         val expected = prefetchLoadUrl
         val result = parseReaderPayload(rawPayload)
-        val tokenMatches = view === prefetchWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
+        val tokenMatches = screen == AppScreen.READER.name &&
+            view === prefetchWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
         val matches = expected.isNotEmpty() && tokenMatches &&
             (sameReaderLoadUrl(pageUrl, expected) || (result != null && sameReaderLoadUrl(result.sourceUrl, expected)))
         if (matches && result != null && !result.isCatalog && result.paragraphs.isNotEmpty()) {
@@ -1348,7 +1409,8 @@ private fun JingduApp(initialUrl: String = "") {
         accepted
     }
     val prefetchErrorState = rememberUpdatedState<(WebView, Long, String, String) -> Unit> { view, requestToken, pageUrl, reason ->
-        if (view === prefetchWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
+        if (screen == AppScreen.READER.name &&
+            view === prefetchWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
             prefetchLoadUrl.isNotEmpty() && sameReaderLoadUrl(pageUrl, prefetchLoadUrl)) {
             val failedUrl = prefetchLoadUrl
             val failedView = view
@@ -1396,7 +1458,8 @@ private fun JingduApp(initialUrl: String = "") {
         var accepted = false
         val expected = previousLoadUrl
         val result = parseReaderPayload(rawPayload)
-        val tokenMatches = view === previousWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
+        val tokenMatches = screen == AppScreen.READER.name &&
+            view === previousWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
         val matches = expected.isNotEmpty() && tokenMatches &&
             (sameReaderLoadUrl(pageUrl, expected) || (result != null && sameReaderLoadUrl(result.sourceUrl, expected)))
         if (matches && result != null && !result.isCatalog && result.paragraphs.isNotEmpty()) {
@@ -1437,7 +1500,8 @@ private fun JingduApp(initialUrl: String = "") {
         accepted
     }
     val previousErrorState = rememberUpdatedState<(WebView, Long, String, String) -> Unit> { view, requestToken, pageUrl, reason ->
-        if (view === previousWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
+        if (screen == AppScreen.READER.name &&
+            view === previousWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
             previousLoadUrl.isNotEmpty() && sameReaderLoadUrl(pageUrl, previousLoadUrl)) {
             val failedUrl = previousPageBaseUrl.takeIf { it.isNotEmpty() } ?: previousLoadUrl
             recordDiagnostic(
@@ -1457,7 +1521,8 @@ private fun JingduApp(initialUrl: String = "") {
     val catalogPayloadState = rememberUpdatedState<(WebView, Long, String, String) -> Boolean> { view, requestToken, pageUrl, rawPayload ->
         val expected = catalogLoadUrl
         val result = parseReaderPayload(rawPayload)
-        val tokenMatches = view === catalogWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
+        val tokenMatches = screen == AppScreen.READER.name &&
+            view === catalogWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
         val matches = expected.isNotEmpty() && tokenMatches &&
             (sameReaderLoadUrl(pageUrl, expected) || (result != null && sameReaderLoadUrl(result.sourceUrl, expected)))
         if (matches && result?.isCatalog == true) {
@@ -1469,7 +1534,8 @@ private fun JingduApp(initialUrl: String = "") {
         }
     }
     val catalogErrorState = rememberUpdatedState<(WebView, Long, String, String) -> Unit> { view, requestToken, pageUrl, reason ->
-        if (view === catalogWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
+        if (screen == AppScreen.READER.name &&
+            view === catalogWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
             catalogLoadUrl.isNotEmpty() && sameReaderLoadUrl(pageUrl, catalogLoadUrl)) {
             recordDiagnostic(
                 "catalog_load_error",
@@ -1504,8 +1570,11 @@ private fun JingduApp(initialUrl: String = "") {
             .apply()
     }
     LaunchedEffect(screen, document, activeLoadUrl) {
-        if (screen != AppScreen.READER.name) clearCloudflareChallenge()
-        if (screen == AppScreen.READER.name && document == null && activeLoadUrl.isBlank()) {
+        if (screen != AppScreen.READER.name) {
+            cancelReaderChapterLoads()
+            return@LaunchedEffect
+        }
+        if (document == null && activeLoadUrl.isBlank()) {
             preferences.getString("last_url", null)?.let { lastUrl ->
                 if (lastUrl.isNotBlank()) openUrl(lastUrl)
             }
@@ -1839,8 +1908,8 @@ private fun JingduApp(initialUrl: String = "") {
                 } == true
                 BackHandler {
                     saveCurrentDocumentCache(commit = true)
+                    cancelReaderChapterLoads()
                     screen = if (currentBookInShelf) AppScreen.BOOKSHELF.name else AppScreen.HOME.name
-                    loading = false
                 }
                 ReaderScreen(
                     document = document,
@@ -1921,7 +1990,8 @@ private fun JingduApp(initialUrl: String = "") {
                         document?.let { current ->
                             saveCachedReaderDocument(preferences, current, commit = true)
                         }
-                        screen = if (currentBookInShelf) AppScreen.BOOKSHELF.name else AppScreen.HOME.name
+                        cancelReaderChapterLoads()
+                    screen = if (currentBookInShelf) AppScreen.BOOKSHELF.name else AppScreen.HOME.name
                         loading = false
                     },
                     onReload = { openUrl(currentUrl, forceReload = true) },
