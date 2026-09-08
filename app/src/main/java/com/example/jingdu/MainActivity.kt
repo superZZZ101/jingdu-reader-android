@@ -1125,10 +1125,17 @@ private fun JingduApp(initialUrl: String = "") {
 
     fun failPendingAutoNext(target: String, reason: String) {
         if (!pendingAutoNext) return
+        val current = document
+        val nextUrl = current?.navigation?.next?.href?.let(::normalizeUrl).orEmpty()
         pendingAutoNext = false
-        loading = false
-        errorMessage = "下一章暂时无法预读取，请点击重试"
-        recordDiagnostic("auto_next_prefetch_failed", target, reason)
+        if (current != null && nextUrl.isNotEmpty() && sameUrl(nextUrl, target)) {
+            recordDiagnostic("auto_next_prefetch_fallback", target, reason)
+            openChapter(target, ChapterOpenPosition.START)
+        } else {
+            loading = false
+            errorMessage = "下一章暂时无法预读取，请点击重试"
+            recordDiagnostic("auto_next_prefetch_failed", target, reason)
+        }
     }
 
     fun handlePrefetchedChapter(result: ReaderDocument, expected: String) {
@@ -1490,7 +1497,9 @@ private fun JingduApp(initialUrl: String = "") {
                 }
                 webViewLoadTarget(view).isEmpty() -> {
                     view.stopLoading()
-                    startWebViewLoad(view, target)
+                    val referer = document?.sourceUrl.orEmpty().takeIf { it.isNotBlank() && !sameUrl(it, target) }
+                        ?: currentUrl.takeIf { it.isNotBlank() && !sameUrl(it, target) }.orEmpty()
+                    startWebViewLoad(view, target, referer)
                 }
             }
         }
@@ -1505,7 +1514,9 @@ private fun JingduApp(initialUrl: String = "") {
                 }
                 webViewLoadTarget(view).isEmpty() -> {
                     view.stopLoading()
-                    startWebViewLoad(view, target)
+                    val referer = document?.sourceUrl.orEmpty().takeIf { it.isNotBlank() && !sameUrl(it, target) }
+                        ?: currentUrl.takeIf { it.isNotBlank() && !sameUrl(it, target) }.orEmpty()
+                    startWebViewLoad(view, target, referer)
                 }
             }
         }
@@ -1555,7 +1566,9 @@ private fun JingduApp(initialUrl: String = "") {
                 }
                 webViewLoadTarget(view).isEmpty() -> {
                     view.stopLoading()
-                    startWebViewLoad(view, target)
+                    val referer = document?.sourceUrl.orEmpty().takeIf { it.isNotBlank() && !sameUrl(it, target) }
+                        ?: currentUrl.takeIf { it.isNotBlank() && !sameUrl(it, target) }.orEmpty()
+                    startWebViewLoad(view, target, referer)
                 }
             }
         }
@@ -1601,7 +1614,9 @@ private fun JingduApp(initialUrl: String = "") {
                 }
                 webViewLoadTarget(view).isEmpty() -> {
                     view.stopLoading()
-                    startWebViewLoad(view, target)
+                    val referer = catalogWebView?.url.orEmpty().takeIf { it.isNotBlank() && !sameUrl(it, target) }
+                        ?: currentUrl.takeIf { it.isNotBlank() && !sameUrl(it, target) }.orEmpty()
+                    startWebViewLoad(view, target, referer)
                 }
             }
         }
@@ -1870,7 +1885,7 @@ private fun JingduApp(initialUrl: String = "") {
     }
 }
 
-private fun fetchReaderHtml(url: String): String? {
+private fun fetchReaderHtml(url: String, referer: String = "", cookie: String = ""): String? {
     if (!url.startsWith("http://") && !url.startsWith("https://")) return null
     val connection = runCatching { java.net.URL(url).openConnection() as java.net.HttpURLConnection }.getOrNull()
         ?: return null
@@ -1882,6 +1897,12 @@ private fun fetchReaderHtml(url: String): String? {
         connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36")
         connection.setRequestProperty("Accept", "text/html,application/xhtml+xml")
         connection.setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.6")
+        if (referer.isNotBlank() && !sameUrl(referer, url)) {
+            connection.setRequestProperty("Referer", referer)
+        }
+        if (cookie.isNotBlank()) {
+            connection.setRequestProperty("Cookie", cookie)
+        }
         if (connection.responseCode !in 200..399) return null
         connection.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
             reader.readText().takeIf { it.isNotBlank() }
@@ -1895,7 +1916,8 @@ private fun fetchReaderHtml(url: String): String? {
 
 private data class ReaderWebViewLoad(
     val token: Long,
-    val target: String
+    val target: String,
+    val referer: String = ""
 )
 
 private var readerWebViewTokenCounter = 0L
@@ -1914,9 +1936,18 @@ private fun webViewLoadToken(view: WebView?): Long = when (val tag = view?.tag) 
 private fun webViewLoadTarget(view: WebView?): String =
     (view?.tag as? ReaderWebViewLoad)?.target.orEmpty()
 
-private fun startWebViewLoad(view: WebView, target: String) {
-    view.tag = ReaderWebViewLoad(nextReaderWebViewToken(), target)
-    view.loadUrl(target)
+private fun webViewLoadReferer(view: WebView?): String =
+    (view?.tag as? ReaderWebViewLoad)?.referer.orEmpty()
+
+private fun startWebViewLoad(view: WebView, target: String, referer: String = "") {
+    view.tag = ReaderWebViewLoad(nextReaderWebViewToken(), target, referer)
+    val headers = linkedMapOf<String, String>()
+    if (referer.isNotBlank() && !sameUrl(referer, target)) {
+        headers["Referer"] = referer
+    }
+    headers["Accept"] = "text/html,application/xhtml+xml"
+    headers["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.6"
+    view.loadUrl(target, headers)
 }
 
 @SuppressLint("SetJavaScriptEnabled")
@@ -1952,15 +1983,19 @@ private fun createReaderWebView(
             }
             nativeFallbackCount += 1
             nativeFallbackInFlightToken = requestToken
+            val referer = webViewLoadReferer(view)
+            val cookie = runCatching {
+                android.webkit.CookieManager.getInstance().getCookie(url).orEmpty()
+            }.getOrDefault("")
             CoroutineScope(Dispatchers.IO).launch {
-                val html = fetchReaderHtml(url)
+                val html = fetchReaderHtml(url, referer, cookie)
                 view.post {
                     if (nativeFallbackInFlightToken != requestToken || requestToken != webViewLoadToken(view)) return@post
                     nativeFallbackInFlightToken = 0L
                     if (html != null) {
                         view.stopLoading()
-                        view.tag = ReaderWebViewLoad(nextReaderWebViewToken(), url)
-                        view.loadDataWithBaseURL(url, html, "text/html", "UTF-8", url)
+                        view.tag = ReaderWebViewLoad(nextReaderWebViewToken(), url, referer)
+                        view.loadDataWithBaseURL(url, html, "text/html", "UTF-8", referer.ifBlank { url })
                     } else {
                         reportError(view, requestToken, url, "$reason;native_fallback_failed")
                     }
