@@ -89,6 +89,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
@@ -420,6 +421,8 @@ private fun JingduApp(initialUrl: String = "") {
     var prefetchWebView by remember { mutableStateOf<WebView?>(null) }
     var previousWebView by remember { mutableStateOf<WebView?>(null) }
     var catalogWebView by remember { mutableStateOf<WebView?>(null) }
+    var cloudflareChallengeWebView by remember { mutableStateOf<WebView?>(null) }
+    var cloudflareChallengeUrl by remember { mutableStateOf("") }
     var activeWebViewGeneration by remember { mutableStateOf(0) }
     var prefetchWebViewGeneration by remember { mutableStateOf(0) }
     var previousWebViewGeneration by remember { mutableStateOf(0) }
@@ -521,7 +524,31 @@ private fun JingduApp(initialUrl: String = "") {
         cachedDocuments = updated
     }
 
+    fun clearCloudflareChallenge(view: WebView? = null) {
+        if (view == null || cloudflareChallengeWebView === view) {
+            cloudflareChallengeWebView?.settings?.loadsImagesAutomatically = false
+            cloudflareChallengeWebView = null
+            cloudflareChallengeUrl = ""
+        }
+    }
+
+    fun claimCloudflareChallenge(view: WebView, url: String, phase: String, token: Long, preferActive: Boolean = false) {
+        val heldByOtherView = cloudflareChallengeWebView != null && cloudflareChallengeWebView !== view
+        if (heldByOtherView && !preferActive) {
+            recordDiagnostic("cloudflare_challenge_deferred", url, "phase=$phase token=$token")
+            return
+        }
+        cloudflareChallengeWebView?.takeUnless { it === view }?.settings?.loadsImagesAutomatically = false
+        cloudflareChallengeWebView = view
+        cloudflareChallengeUrl = url
+        loading = false
+        errorMessage = null
+        recordDiagnostic("cloudflare_challenge", url, "phase=$phase token=$token")
+    }
+
     fun restartActiveWebView() {
+        clearCloudflareChallenge(activeWebView)
+        activeWebView?.settings?.loadsImagesAutomatically = false
         activeWebView?.stopLoading()
         activeWebView = null
         activeWebViewGeneration += 1
@@ -529,6 +556,8 @@ private fun JingduApp(initialUrl: String = "") {
     }
 
     fun restartPrefetchWebView() {
+        clearCloudflareChallenge(prefetchWebView)
+        prefetchWebView?.settings?.loadsImagesAutomatically = false
         prefetchWebView?.stopLoading()
         prefetchWebView = null
         prefetchWebViewGeneration += 1
@@ -536,6 +565,8 @@ private fun JingduApp(initialUrl: String = "") {
     }
 
     fun restartPreviousWebView() {
+        clearCloudflareChallenge(previousWebView)
+        previousWebView?.settings?.loadsImagesAutomatically = false
         previousWebView?.stopLoading()
         previousWebView = null
         previousWebViewGeneration += 1
@@ -543,6 +574,8 @@ private fun JingduApp(initialUrl: String = "") {
     }
 
     fun restartCatalogWebView() {
+        clearCloudflareChallenge(catalogWebView)
+        catalogWebView?.settings?.loadsImagesAutomatically = false
         catalogWebView?.stopLoading()
         catalogWebView = null
         catalogWebViewGeneration += 1
@@ -1217,7 +1250,11 @@ private fun JingduApp(initialUrl: String = "") {
 
     fun handleActiveError(view: WebView, requestToken: Long, pageUrl: String, reason: String) {
         if (view === activeWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
-            activeLoadUrl.isNotEmpty() && sameUrl(pageUrl, activeLoadUrl)) {
+            activeLoadUrl.isNotEmpty() && sameReaderLoadUrl(pageUrl, activeLoadUrl)) {
+            if (isCloudflareChallengeReason(reason)) {
+                claimCloudflareChallenge(view, pageUrl, "active", requestToken, preferActive = true)
+                return
+            }
             val failedUrl = activeLoadUrl
             val failedView = view
             val failedToken = requestToken
@@ -1263,10 +1300,11 @@ private fun JingduApp(initialUrl: String = "") {
         val result = parseReaderPayload(rawPayload)
         val tokenMatches = view === activeWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
         val matches = expected.isNotEmpty() && tokenMatches &&
-            (sameUrl(pageUrl, expected) || (result != null && sameUrl(result.sourceUrl, expected)))
+            (sameReaderLoadUrl(pageUrl, expected) || (result != null && sameReaderLoadUrl(result.sourceUrl, expected)))
         if (matches) {
             val pending = pendingChapterNavigation
             if ((pending == null || sameUrl(pending.url, expected)) && result?.isUsableForReading() == true) {
+                clearCloudflareChallenge(view)
                 activeRetryUrl = ""
                 activeRetryCount = 0
                 activeRetryScheduled = false
@@ -1296,8 +1334,9 @@ private fun JingduApp(initialUrl: String = "") {
         val result = parseReaderPayload(rawPayload)
         val tokenMatches = view === prefetchWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
         val matches = expected.isNotEmpty() && tokenMatches &&
-            (sameUrl(pageUrl, expected) || (result != null && sameUrl(result.sourceUrl, expected)))
+            (sameReaderLoadUrl(pageUrl, expected) || (result != null && sameReaderLoadUrl(result.sourceUrl, expected)))
         if (matches && result != null && !result.isCatalog && result.paragraphs.isNotEmpty()) {
+            clearCloudflareChallenge(view)
             prefetchRetryUrl = ""
             prefetchRetryCount = 0
             prefetchRetryScheduled = false
@@ -1308,7 +1347,7 @@ private fun JingduApp(initialUrl: String = "") {
     }
     val prefetchErrorState = rememberUpdatedState<(WebView, Long, String, String) -> Unit> { view, requestToken, pageUrl, reason ->
         if (view === prefetchWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
-            prefetchLoadUrl.isNotEmpty() && sameUrl(pageUrl, prefetchLoadUrl)) {
+            prefetchLoadUrl.isNotEmpty() && sameReaderLoadUrl(pageUrl, prefetchLoadUrl)) {
             val failedUrl = prefetchLoadUrl
             val failedView = view
             val failedToken = requestToken
@@ -1318,32 +1357,36 @@ private fun JingduApp(initialUrl: String = "") {
                 failedUrl,
                 "token=$failedToken pageUrl=$pageUrl retry=$prefetchRetryCount reason=$reason"
             )
-            if (prefetchRetryUrl != failedUrl) {
-                prefetchRetryUrl = failedUrl
-                prefetchRetryCount = 0
-                prefetchRetryScheduled = false
-            }
-            if (prefetchRetryCount < 2 && !prefetchRetryScheduled) {
-                prefetchRetryCount += 1
-                prefetchRetryScheduled = true
-                val retryDelay = 900L * prefetchRetryCount
-                failedView.postDelayed({
-                    if (prefetchRequestId != failedRequestId) return@postDelayed
+            if (isCloudflareChallengeReason(reason)) {
+                claimCloudflareChallenge(failedView, failedUrl, "prefetch", failedToken)
+            } else {
+                if (prefetchRetryUrl != failedUrl) {
+                    prefetchRetryUrl = failedUrl
+                    prefetchRetryCount = 0
                     prefetchRetryScheduled = false
-                    if (prefetchWebView === failedView &&
-                        webViewLoadToken(failedView) == failedToken &&
-                        prefetchLoadUrl.isNotEmpty() && sameUrl(prefetchLoadUrl, failedUrl)
-                    ) {
-                        restartPrefetchWebView()
-                    }
-                }, retryDelay)
-            } else if (!prefetchRetryScheduled) {
-                prefetchLoadUrl = ""
-                prefetchPageBaseUrl = ""
-                prefetchRetryUrl = ""
-                prefetchRetryCount = 0
-                fallbackPendingChapterToActive(failedUrl)
-                failPendingAutoNext(failedUrl, "retry_exhausted")
+                }
+                if (prefetchRetryCount < 2 && !prefetchRetryScheduled) {
+                    prefetchRetryCount += 1
+                    prefetchRetryScheduled = true
+                    val retryDelay = 900L * prefetchRetryCount
+                    failedView.postDelayed({
+                        if (prefetchRequestId != failedRequestId) return@postDelayed
+                        prefetchRetryScheduled = false
+                        if (prefetchWebView === failedView &&
+                            webViewLoadToken(failedView) == failedToken &&
+                            prefetchLoadUrl.isNotEmpty() && sameUrl(prefetchLoadUrl, failedUrl)
+                        ) {
+                            restartPrefetchWebView()
+                        }
+                    }, retryDelay)
+                } else if (!prefetchRetryScheduled) {
+                    prefetchLoadUrl = ""
+                    prefetchPageBaseUrl = ""
+                    prefetchRetryUrl = ""
+                    prefetchRetryCount = 0
+                    fallbackPendingChapterToActive(failedUrl)
+                    failPendingAutoNext(failedUrl, "retry_exhausted")
+                }
             }
         }
     }
@@ -1353,8 +1396,9 @@ private fun JingduApp(initialUrl: String = "") {
         val result = parseReaderPayload(rawPayload)
         val tokenMatches = view === previousWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
         val matches = expected.isNotEmpty() && tokenMatches &&
-            (sameUrl(pageUrl, expected) || (result != null && sameUrl(result.sourceUrl, expected)))
+            (sameReaderLoadUrl(pageUrl, expected) || (result != null && sameReaderLoadUrl(result.sourceUrl, expected)))
         if (matches && result != null && !result.isCatalog && result.paragraphs.isNotEmpty()) {
+            clearCloudflareChallenge(view)
             val baseUrl = previousPageBaseUrl
             val base = baseUrl.takeIf { it.isNotEmpty() }?.let(::findCached)
             val merged = mergeCachedContinuation(
@@ -1392,16 +1436,20 @@ private fun JingduApp(initialUrl: String = "") {
     }
     val previousErrorState = rememberUpdatedState<(WebView, Long, String, String) -> Unit> { view, requestToken, pageUrl, reason ->
         if (view === previousWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
-            previousLoadUrl.isNotEmpty() && sameUrl(pageUrl, previousLoadUrl)) {
+            previousLoadUrl.isNotEmpty() && sameReaderLoadUrl(pageUrl, previousLoadUrl)) {
             val failedUrl = previousPageBaseUrl.takeIf { it.isNotEmpty() } ?: previousLoadUrl
             recordDiagnostic(
                 "previous_load_error",
                 failedUrl,
                 "token=$requestToken pageUrl=$pageUrl reason=$reason"
             )
-            previousLoadUrl = ""
-            previousPageBaseUrl = ""
-            fallbackPendingChapterToActive(failedUrl)
+            if (isCloudflareChallengeReason(reason)) {
+                claimCloudflareChallenge(view, pageUrl, "previous", requestToken)
+            } else {
+                previousLoadUrl = ""
+                previousPageBaseUrl = ""
+                fallbackPendingChapterToActive(failedUrl)
+            }
         }
     }
     val catalogPayloadState = rememberUpdatedState<(WebView, Long, String, String) -> Boolean> { view, requestToken, pageUrl, rawPayload ->
@@ -1409,8 +1457,9 @@ private fun JingduApp(initialUrl: String = "") {
         val result = parseReaderPayload(rawPayload)
         val tokenMatches = view === catalogWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
         val matches = expected.isNotEmpty() && tokenMatches &&
-            (sameUrl(pageUrl, expected) || (result != null && sameUrl(result.sourceUrl, expected)))
+            (sameReaderLoadUrl(pageUrl, expected) || (result != null && sameReaderLoadUrl(result.sourceUrl, expected)))
         if (matches && result?.isCatalog == true) {
+            clearCloudflareChallenge(view)
             acceptCatalogPage(result, expected)
             true
         } else {
@@ -1419,15 +1468,19 @@ private fun JingduApp(initialUrl: String = "") {
     }
     val catalogErrorState = rememberUpdatedState<(WebView, Long, String, String) -> Unit> { view, requestToken, pageUrl, reason ->
         if (view === catalogWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
-            catalogLoadUrl.isNotEmpty() && sameUrl(pageUrl, catalogLoadUrl)) {
+            catalogLoadUrl.isNotEmpty() && sameReaderLoadUrl(pageUrl, catalogLoadUrl)) {
             recordDiagnostic(
                 "catalog_load_error",
                 catalogLoadUrl,
                 "token=$requestToken pageUrl=$pageUrl reason=$reason"
             )
-            catalogLoadUrl = ""
-            catalogComplete = false
-            catalogErrorMessage = "目录暂时无法读取，请点击重试"
+            if (isCloudflareChallengeReason(reason)) {
+                claimCloudflareChallenge(view, pageUrl, "catalog", requestToken)
+            } else {
+                catalogLoadUrl = ""
+                catalogComplete = false
+                catalogErrorMessage = "目录暂时无法读取，请点击重试"
+            }
         }
     }
 
@@ -1449,6 +1502,7 @@ private fun JingduApp(initialUrl: String = "") {
             .apply()
     }
     LaunchedEffect(screen, document, activeLoadUrl) {
+        if (screen != AppScreen.READER.name) clearCloudflareChallenge()
         if (screen == AppScreen.READER.name && document == null && activeLoadUrl.isBlank()) {
             preferences.getString("last_url", null)?.let { lastUrl ->
                 if (lastUrl.isNotBlank()) openUrl(lastUrl)
@@ -1526,14 +1580,15 @@ private fun JingduApp(initialUrl: String = "") {
         prefetchRequestId,
         prefetchPageBaseUrl,
         pendingChapterNavigation?.url,
-        pendingAutoNext
+        pendingAutoNext,
+        cloudflareChallengeWebView
     ) {
         val target = prefetchLoadUrl
         val requestId = prefetchRequestId
         val baseUrl = prefetchPageBaseUrl
         val pendingUrl = pendingChapterNavigation?.url
         val waitingForAutoNext = pendingAutoNext
-        if (target.isEmpty()) return@LaunchedEffect
+        if (target.isEmpty() || cloudflareChallengeWebView != null) return@LaunchedEffect
         delay(20_000)
         if (prefetchRequestId != requestId ||
             !sameUrl(prefetchLoadUrl, target) ||
@@ -1577,13 +1632,14 @@ private fun JingduApp(initialUrl: String = "") {
         previousLoadUrl,
         previousRequestId,
         previousPageBaseUrl,
-        pendingChapterNavigation?.url
+        pendingChapterNavigation?.url,
+        cloudflareChallengeWebView
     ) {
         val target = previousLoadUrl
         val requestId = previousRequestId
         val baseUrl = previousPageBaseUrl
         val pendingUrl = pendingChapterNavigation?.url
-        if (target.isEmpty()) return@LaunchedEffect
+        if (target.isEmpty() || cloudflareChallengeWebView != null) return@LaunchedEffect
         delay(20_000)
         if (previousRequestId != requestId ||
             !sameUrl(previousLoadUrl, target) ||
@@ -1643,7 +1699,11 @@ private fun JingduApp(initialUrl: String = "") {
         Box(modifier = Modifier.fillMaxSize().background(windowBackground)) {
             key(activeWebViewGeneration) {
                 AndroidView(
-                    modifier = Modifier.size(1.dp).alpha(0f),
+                    modifier = if (screen == AppScreen.READER.name && cloudflareChallengeWebView === activeWebView) {
+                        Modifier.fillMaxSize().zIndex(10f)
+                    } else {
+                        Modifier.size(1.dp).alpha(0f)
+                    },
                     factory = { viewContext ->
                         createReaderWebView(
                             context = viewContext,
@@ -1656,7 +1716,14 @@ private fun JingduApp(initialUrl: String = "") {
             }
             key(prefetchWebViewGeneration) {
                 AndroidView(
-                    modifier = Modifier.size(1.dp).alpha(0f),
+                    modifier = if (screen == AppScreen.READER.name &&
+                        cloudflareChallengeWebView === prefetchWebView &&
+                        (pendingAutoNext || pendingChapterNavigation != null)
+                    ) {
+                        Modifier.fillMaxSize().zIndex(10f)
+                    } else {
+                        Modifier.size(1.dp).alpha(0f)
+                    },
                     factory = { viewContext ->
                         createReaderWebView(
                             context = viewContext,
@@ -1669,7 +1736,14 @@ private fun JingduApp(initialUrl: String = "") {
             }
             key(previousWebViewGeneration) {
                 AndroidView(
-                    modifier = Modifier.size(1.dp).alpha(0f),
+                    modifier = if (screen == AppScreen.READER.name &&
+                        cloudflareChallengeWebView === previousWebView &&
+                        pendingChapterNavigation != null
+                    ) {
+                        Modifier.fillMaxSize().zIndex(10f)
+                    } else {
+                        Modifier.size(1.dp).alpha(0f)
+                    },
                     factory = { viewContext ->
                         createReaderWebView(
                             context = viewContext,
@@ -1682,7 +1756,14 @@ private fun JingduApp(initialUrl: String = "") {
             }
             key(catalogWebViewGeneration) {
                 AndroidView(
-                    modifier = Modifier.size(1.dp).alpha(0f),
+                    modifier = if (screen == AppScreen.READER.name &&
+                        cloudflareChallengeWebView === catalogWebView &&
+                        catalogLoadUrl.isNotEmpty()
+                    ) {
+                        Modifier.fillMaxSize().zIndex(10f)
+                    } else {
+                        Modifier.size(1.dp).alpha(0f)
+                    },
                     factory = { viewContext ->
                         createReaderWebView(
                             context = viewContext,
@@ -1885,6 +1966,28 @@ private fun JingduApp(initialUrl: String = "") {
     }
 }
 
+private const val CLOUDFLARE_CHALLENGE_REASON = "cloudflare_challenge"
+
+private fun isCloudflareChallengeReason(reason: String): Boolean =
+    reason.startsWith(CLOUDFLARE_CHALLENGE_REASON)
+
+private fun isCloudflareChallengeResponse(response: android.webkit.WebResourceResponse): Boolean {
+    return response.responseHeaders.orEmpty().entries.any { (name, value) ->
+        name.equals("Cf-Mitigated", ignoreCase = true) &&
+            value?.contains("challenge", ignoreCase = true) == true
+    }
+}
+
+private fun rawPayloadLooksLikeCloudflareChallenge(rawPayload: String): Boolean {
+    val value = rawPayload.lowercase(Locale.ROOT)
+    return value.contains("just a moment") ||
+        value.contains("verify you are human") ||
+        value.contains("checking your browser") ||
+        value.contains("cf-turnstile") ||
+        value.contains("security verification") ||
+        rawPayload.contains("安全验证")
+}
+
 private fun fetchReaderHtml(url: String, referer: String = "", cookie: String = ""): String? {
     if (!url.startsWith("http://") && !url.startsWith("https://")) return null
     val connection = runCatching { java.net.URL(url).openConnection() as java.net.HttpURLConnection }.getOrNull()
@@ -1961,6 +2064,7 @@ private fun createReaderWebView(
         var nativeFallbackInFlightToken = 0L
         var nativeFallbackUrl = ""
         var nativeFallbackCount = 0
+        var cloudflareChallengeToken = 0L
         var acceptedPayloadToken = 0L
         var reportedErrorToken = 0L
 
@@ -1970,8 +2074,16 @@ private fun createReaderWebView(
             onError(view, requestToken, url, reason)
         }
 
+        fun reportCloudflareChallenge(view: WebView, requestToken: Long, url: String, details: String) {
+            if (requestToken == 0L) return
+            cloudflareChallengeToken = requestToken
+            view.settings.loadsImagesAutomatically = true
+            view.requestFocus()
+            reportError(view, requestToken, url, "$CLOUDFLARE_CHALLENGE_REASON;$details")
+        }
+
         fun tryNativeFallback(view: WebView, url: String, requestToken: Long, reason: String) {
-            if (requestToken == 0L || nativeFallbackToken == requestToken) return
+            if (requestToken == 0L || nativeFallbackToken == requestToken || cloudflareChallengeToken == requestToken) return
             nativeFallbackToken = requestToken
             if (url != nativeFallbackUrl) {
                 nativeFallbackUrl = url
@@ -1995,7 +2107,7 @@ private fun createReaderWebView(
                     if (html != null) {
                         view.stopLoading()
                         view.tag = ReaderWebViewLoad(nextReaderWebViewToken(), url, referer)
-                        view.loadDataWithBaseURL(url, html, "text/html", "UTF-8", referer.ifBlank { url })
+                        view.loadDataWithBaseURL(url, html, "text/html", "UTF-8", url)
                     } else {
                         reportError(view, requestToken, url, "$reason;native_fallback_failed")
                     }
@@ -2003,8 +2115,12 @@ private fun createReaderWebView(
             }
         }
 
-        layoutParams = ViewGroup.LayoutParams(1, 1)
+        layoutParams = ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        )
         setBackgroundColor(AndroidColor.TRANSPARENT)
+        android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
         settings.loadsImagesAutomatically = false
@@ -2024,14 +2140,22 @@ private fun createReaderWebView(
                     if (requestToken != webViewLoadToken(view)) return@postDelayed
                     if (acceptedPayloadToken == requestToken) return@postDelayed
                     val currentUrl = view.url.orEmpty()
-                    if (currentUrl.isNotEmpty() && !sameUrl(currentUrl, url)) return@postDelayed
+                    if (currentUrl.isNotEmpty() && !sameReaderLoadUrl(currentUrl, url)) return@postDelayed
                     view.evaluateJavascript(ReaderScript.extract) { rawPayload ->
                         if (onPayload(view, requestToken, url, rawPayload)) {
                             acceptedPayloadToken = requestToken
                             if (nativeFallbackInFlightToken == requestToken) nativeFallbackInFlightToken = 0L
                         } else if (finalAttempt && requestToken == webViewLoadToken(view)) {
-                            if (nativeFallbackInFlightToken != requestToken) {
-                                tryNativeFallback(view, url, requestToken, "payload_unusable_or_not_found")
+                            view.evaluateJavascript(ReaderScript.challengeProbe) { challengePayload ->
+                                if (requestToken == webViewLoadToken(view) &&
+                                    rawPayloadLooksLikeCloudflareChallenge(challengePayload)
+                                ) {
+                                    reportCloudflareChallenge(view, requestToken, url, "page_probe=true")
+                                } else if (requestToken == webViewLoadToken(view) &&
+                                    nativeFallbackInFlightToken != requestToken
+                                ) {
+                                    tryNativeFallback(view, url, requestToken, "payload_unusable_or_not_found")
+                                }
                             }
                         }
                     }
@@ -2040,6 +2164,11 @@ private fun createReaderWebView(
 
             override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
                 val requestToken = webViewLoadToken(view)
+                if (cloudflareChallengeToken == requestToken &&
+                    !url.contains("__cf_chl_", ignoreCase = true)
+                ) {
+                    cloudflareChallengeToken = 0L
+                }
                 scheduleExtraction(view, url, requestToken, 1_200L)
                 scheduleExtraction(view, url, requestToken, 3_500L)
                 scheduleExtraction(view, url, requestToken, 8_000L, finalAttempt = true)
@@ -2047,8 +2176,15 @@ private fun createReaderWebView(
                     if (requestToken != webViewLoadToken(view)) return@postDelayed
                     if (acceptedPayloadToken == requestToken) return@postDelayed
                     val currentUrl = view.url.orEmpty()
-                    if (currentUrl.isEmpty() || sameUrl(currentUrl, url)) {
-                        tryNativeFallback(view, url, requestToken, "webview_load_timeout")
+                    if (currentUrl.isEmpty() || sameReaderLoadUrl(currentUrl, url)) {
+                        view.evaluateJavascript(ReaderScript.challengeProbe) { challengePayload ->
+                            if (requestToken != webViewLoadToken(view)) return@evaluateJavascript
+                            if (rawPayloadLooksLikeCloudflareChallenge(challengePayload)) {
+                                reportCloudflareChallenge(view, requestToken, url, "timeout_probe=true")
+                            } else {
+                                tryNativeFallback(view, url, requestToken, "webview_load_timeout")
+                            }
+                        }
                     }
                 }, 7_000L)
             }
@@ -2078,12 +2214,23 @@ private fun createReaderWebView(
                 errorResponse: android.webkit.WebResourceResponse
             ) {
                 if (request.isForMainFrame) {
-                    tryNativeFallback(
-                        view,
-                        request.url.toString(),
-                        webViewLoadToken(view),
-                        "http_error status=${errorResponse.statusCode} reason=${errorResponse.reasonPhrase}"
-                    )
+                    val requestUrl = request.url.toString()
+                    val requestToken = webViewLoadToken(view)
+                    if (isCloudflareChallengeResponse(errorResponse)) {
+                        reportCloudflareChallenge(
+                            view,
+                            requestToken,
+                            requestUrl,
+                            "status=${errorResponse.statusCode}"
+                        )
+                    } else {
+                        tryNativeFallback(
+                            view,
+                            requestUrl,
+                            requestToken,
+                            "http_error status=${errorResponse.statusCode} reason=${errorResponse.reasonPhrase}"
+                        )
+                    }
                 }
             }
         }
@@ -4095,6 +4242,22 @@ private fun sameUrl(first: String, second: String): Boolean {
     val left = cacheKey(first)
     val right = cacheKey(second)
     return left.isNotEmpty() && left == right
+}
+
+private fun sameReaderLoadUrl(first: String, second: String): Boolean {
+    if (sameUrl(first, second)) return true
+    val left = runCatching { Uri.parse(normalizeUrl(first)) }.getOrNull() ?: return false
+    val right = runCatching { Uri.parse(normalizeUrl(second)) }.getOrNull() ?: return false
+    if (!left.scheme.equals(right.scheme, ignoreCase = true) ||
+        !left.host.equals(right.host, ignoreCase = true) ||
+        left.encodedPath != right.encodedPath
+    ) return false
+
+    fun stableQuery(uri: Uri): List<String> = uri.queryParameterNames
+        .filterNot { it.startsWith("__cf_chl_", ignoreCase = true) }
+        .sorted()
+        .map { name -> "$name=${uri.getQueryParameter(name).orEmpty()}" }
+    return stableQuery(left) == stableQuery(right)
 }
 
 private fun sameChapter(first: String, second: String): Boolean {

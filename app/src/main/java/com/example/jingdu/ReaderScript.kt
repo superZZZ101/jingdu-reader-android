@@ -1,6 +1,13 @@
 package com.example.jingdu
 
 object ReaderScript {
+    val challengeProbe = """
+        (() => JSON.stringify({
+          title: document.title || '',
+          text: (document.body?.innerText || '').slice(0, 800)
+        }))()
+    """.trimIndent()
+
     val extract = """
         (() => {
           const NOISE = 'script,style,noscript,template,iframe,canvas,svg,nav,aside,header,footer,form,button,input,textarea,select,option,[role="navigation"],[role="complementary"],[aria-hidden="true"],[hidden],.topbar,.header,.nav,.m-nav,.m-setting,.footer,.section-opt,.hotcmd-wp,.hotcmd-box,.ad,.ads,.advert,.advertisement,.adsbygoogle,.ad-container,[class*="ad-"],[class*="-ad"],[id*="ad-"],[id*="-ad"],.popup,.modal,.overlay,.recommend,.recommendation,.related,.share,.social,.comment,.comments,.toolbar,.pagination,.chapter-nav,.breadcrumb,.notice,.copyright';
