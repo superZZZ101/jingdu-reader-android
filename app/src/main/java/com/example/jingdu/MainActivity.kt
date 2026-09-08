@@ -984,7 +984,8 @@ private fun JingduApp(initialUrl: String = "") {
         catalogIndexOverride: Int? = null,
         verticalIndexOverride: Int? = null,
         verticalOffsetOverride: Int? = null,
-        forceReload: Boolean = false
+        forceReload: Boolean = false,
+        keepCurrentDocumentWhileLoading: Boolean = false
     ) {
         val normalized = normalizeUrl(raw)
         val catalogContext = catalogUrlOverride?.let(::normalizeUrl)?.takeIf { it.isNotEmpty() }
@@ -1092,7 +1093,7 @@ private fun JingduApp(initialUrl: String = "") {
                 return
             }
             pendingChapterNavigation = pendingNavigation
-            document = null
+            if (!keepCurrentDocumentWhileLoading) document = null
             errorMessage = null
             loading = true
             currentUrl = normalized
@@ -1122,7 +1123,8 @@ private fun JingduApp(initialUrl: String = "") {
             normalized,
             openPosition = position,
             verticalIndexOverride = verticalIndex,
-            verticalOffsetOverride = verticalOffset
+            verticalOffsetOverride = verticalOffset,
+            keepCurrentDocumentWhileLoading = true
         )
     }
 
@@ -2485,7 +2487,7 @@ private fun ReaderScreen(
                 }
         ) {
             when {
-                loading -> LoadingView(palette)
+                loading && document == null -> LoadingView(palette)
                 errorMessage != null -> ErrorView(
                      message = errorMessage,
                      palette = palette,
@@ -3760,7 +3762,7 @@ private fun HorizontalChapterView(
 
 private val HorizontalPageHorizontalPadding = 22.dp
 private val HorizontalPageTopPadding = 64.dp
-private val HorizontalPageBottomPadding = 52.dp
+private val HorizontalPageBottomPadding = 42.dp
 private val HorizontalPageTextBottomSafety = 1.dp
 
 private fun horizontalHeaderHeightPx(
