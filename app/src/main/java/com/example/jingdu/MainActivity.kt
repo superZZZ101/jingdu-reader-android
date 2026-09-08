@@ -220,6 +220,18 @@ private data class ChapterPage(
     val startOffset: Int
 )
 
+private data class ReadingPositionSnapshot(
+    val sourceUrl: String,
+    val textOffset: Int,
+    val progressIndex: Int,
+    val progressIndexKey: String,
+    val viewportOffset: Int?
+)
+
+private class ReadingPositionHolder {
+    var value: ReadingPositionSnapshot? = null
+}
+
 private data class VerticalViewport(
     val scrolling: Boolean,
     val firstVisible: Int,
@@ -379,6 +391,22 @@ private fun JingduApp(initialUrl: String = "") {
     var currentUrl by rememberSaveable {
         mutableStateOf(restoredDocument?.sourceUrl.orEmpty())
     }
+    val latestReadingPosition = remember { ReadingPositionHolder() }
+
+    fun saveLatestReadingPosition(commit: Boolean = false) {
+        latestReadingPosition.value?.let { position ->
+            val editor = preferences.edit()
+                .putInt(position.progressIndexKey, position.progressIndex)
+                .putInt(progressOffsetKey(position.sourceUrl), position.textOffset)
+            if (position.viewportOffset != null) {
+                editor.putInt(progressViewportKey(position.sourceUrl), position.viewportOffset)
+            } else {
+                editor.remove(progressViewportKey(position.sourceUrl))
+            }
+            if (commit) editor.commit() else editor.apply()
+        }
+    }
+
     LaunchedEffect(initialUrl) {
         if (initialUrl.isNotBlank()) address = initialUrl
     }
@@ -390,6 +418,7 @@ private fun JingduApp(initialUrl: String = "") {
                 document?.let {
                     saveCachedReaderDocument(preferences, it, commit = true)
                 }
+                saveLatestReadingPosition(commit = true)
             }
         }
         lifecycle?.addObserver(observer)
@@ -1908,6 +1937,7 @@ private fun JingduApp(initialUrl: String = "") {
                 } == true
                 BackHandler {
                     saveCurrentDocumentCache(commit = true)
+                    saveLatestReadingPosition(commit = true)
                     cancelReaderChapterLoads()
                     screen = if (currentBookInShelf) AppScreen.BOOKSHELF.name else AppScreen.HOME.name
                 }
@@ -1941,6 +1971,7 @@ private fun JingduApp(initialUrl: String = "") {
                                  if (latestOffset != null) {
                                      preferences.edit()
                                          .putInt(progressOffsetKey(sourceUrl), latestOffset)
+                                          .remove(progressViewportKey(sourceUrl))
                                          .apply()
                                  }
                              }
@@ -1953,11 +1984,12 @@ private fun JingduApp(initialUrl: String = "") {
                         saveSettings(preferences, updatedSettings)
                         activity?.requestedOrientation = updatedSettings.screenOrientation.toRequestedOrientation()
                     },
-                    onPositionChange = { sourceUrl, offset ->
-                         if (document?.sourceUrl?.let { current -> sameUrl(current, sourceUrl) } == true) {
-                             readingOffset = offset
+                    onPositionChange = { position, persist ->
+                         latestReadingPosition.value = position
+                         if (persist && document?.sourceUrl?.let { current -> sameUrl(current, position.sourceUrl) } == true) {
+                             readingOffset = position.textOffset
                          }
-                         preferences.edit().putInt(progressOffsetKey(sourceUrl), offset).apply()
+                         if (persist) saveLatestReadingPosition()
                      },
                     onNavigate = { openUrl(it) },
                     onNavigateChapter = { href, position ->
@@ -1990,8 +2022,9 @@ private fun JingduApp(initialUrl: String = "") {
                         document?.let { current ->
                             saveCachedReaderDocument(preferences, current, commit = true)
                         }
+                        saveLatestReadingPosition(commit = true)
                         cancelReaderChapterLoads()
-                    screen = if (currentBookInShelf) AppScreen.BOOKSHELF.name else AppScreen.HOME.name
+                        screen = if (currentBookInShelf) AppScreen.BOOKSHELF.name else AppScreen.HOME.name
                         loading = false
                     },
                     onReload = { openUrl(currentUrl, forceReload = true) },
@@ -2521,7 +2554,7 @@ private fun ReaderScreen(
     isInBookshelf: Boolean,
     onAddToBookshelf: () -> Unit,
     onSettingsChange: (ReaderSettings) -> Unit,
-    onPositionChange: (String, Int) -> Unit,
+    onPositionChange: (ReadingPositionSnapshot, Boolean) -> Unit,
     onNavigate: (String) -> Unit,
     onNavigateChapter: (String, ChapterOpenPosition) -> Unit,
     onContinueToChapter: (String, Int, Int) -> Unit,
@@ -3306,7 +3339,7 @@ private fun ChapterView(
     previousChapter: ReaderDocument?,
     nextChapter: ReaderDocument?,
     nextChapterReady: Boolean,
-    onPositionChange: (String, Int) -> Unit,
+    onPositionChange: (ReadingPositionSnapshot, Boolean) -> Unit,
     onContinueToChapter: (String, Int, Int) -> Unit,
     onNavigateChapter: (String, ChapterOpenPosition) -> Unit,
     onAutoNext: () -> Unit
@@ -3354,7 +3387,7 @@ private fun VerticalChapterView(
     verticalOpenOffset: Int?,
     previousChapter: ReaderDocument?,
     nextChapter: ReaderDocument?,
-    onPositionChange: (String, Int) -> Unit,
+    onPositionChange: (ReadingPositionSnapshot, Boolean) -> Unit,
     onContinueToChapter: (String, Int, Int) -> Unit,
     onNavigateChapter: (String, ChapterOpenPosition) -> Unit,
     onAutoNext: () -> Unit
@@ -3373,20 +3406,65 @@ private fun VerticalChapterView(
     var suppressBoundaryNavigation by remember(document.sourceUrl) { mutableStateOf(false) }
     var userScrollGeneration by remember { mutableStateOf(0) }
 
-    LaunchedEffect(document.sourceUrl, chapterOpenPosition, verticalOpenIndex, verticalOpenOffset) {
+    fun positionForViewport(viewport: VerticalViewport): ReadingPositionSnapshot? {
+        val index = viewport.firstVisible
+        if (index < 0) return null
+        val targetDocument: ReaderDocument
+        val relativeIndex: Int
+        when {
+            nextChapter != null && index >= nextStartIndex -> {
+                targetDocument = nextChapter
+                relativeIndex = (index - nextStartIndex).coerceIn(0, nextChapter.paragraphs.size)
+            }
+            index >= currentStartIndex -> {
+                targetDocument = document
+                relativeIndex = (index - currentStartIndex).coerceIn(0, document.paragraphs.size)
+            }
+            previousChapter != null -> {
+                targetDocument = previousChapter
+                relativeIndex = index.coerceIn(0, previousChapter.paragraphs.size)
+            }
+            else -> {
+                targetDocument = document
+                relativeIndex = 0
+            }
+        }
+        val offsets = paragraphStartOffsets(targetDocument)
+        val paragraphIndex = (relativeIndex - 1).coerceIn(0, max(0, targetDocument.paragraphs.size - 1))
+        return ReadingPositionSnapshot(
+            sourceUrl = targetDocument.sourceUrl,
+            textOffset = offsets.getOrElse(paragraphIndex) { 0 },
+            progressIndex = relativeIndex,
+            progressIndexKey = progressKey(targetDocument.sourceUrl),
+            viewportOffset = viewport.firstOffset
+        )
+    }
+
+    LaunchedEffect(
+        document.sourceUrl,
+        chapterOpenPosition,
+        verticalOpenIndex,
+        verticalOpenOffset,
+        currentStartIndex,
+        totalItemCount
+    ) {
         positionRestored = false
         skipInitialPositionSave = true
         val saved = preferences.getInt(progressKey(document.sourceUrl), 0)
         val savedOffset = preferences.getInt(progressOffsetKey(document.sourceUrl), -1)
+        val savedViewportOffset = preferences.getInt(progressViewportKey(document.sourceUrl), -1)
         val anchorOffset = savedOffset.takeIf { it >= 0 } ?: readingOffset
         val hasContinuationPosition = chapterOpenPosition == null && verticalOpenIndex != null
+        val hasSavedViewportPosition = chapterOpenPosition == null && verticalOpenIndex == null && savedViewportOffset >= 0
         val relativeIndex = if (hasContinuationPosition) {
             verticalOpenIndex.coerceIn(0, document.paragraphs.size)
         } else {
             when (chapterOpenPosition) {
                 ChapterOpenPosition.START -> 0
                 ChapterOpenPosition.END -> document.paragraphs.size
-                null -> if (anchorOffset != null) {
+                null -> if (hasSavedViewportPosition) {
+                    saved.coerceIn(0, document.paragraphs.size)
+                } else if (anchorOffset != null) {
                     (paragraphIndexForOffset(document, anchorOffset) + 1).coerceIn(0, document.paragraphs.size)
                 } else {
                     saved.coerceIn(0, document.paragraphs.size)
@@ -3394,7 +3472,11 @@ private fun VerticalChapterView(
             }
         }
         val target = currentStartIndex + relativeIndex
-        val offset = if (hasContinuationPosition) verticalOpenOffset?.coerceAtLeast(0) ?: 0 else 0
+        val offset = when {
+            hasContinuationPosition -> verticalOpenOffset?.coerceAtLeast(0) ?: 0
+            hasSavedViewportPosition -> savedViewportOffset.coerceAtLeast(0)
+            else -> 0
+        }
         val boundedTarget = target.coerceIn(0, max(0, totalItemCount - 1))
         suppressBoundaryNavigation = true
         var restored = false
@@ -3404,7 +3486,7 @@ private fun VerticalChapterView(
                 delay(40)
                 val layout = listState.layoutInfo
                 val targetVisible = layout.visibleItemsInfo.any { it.index == boundedTarget }
-                val atEnd = !listState.canScrollForward && layout.visibleItemsInfo.lastOrNull()?.index == boundedTarget
+                val atEnd = !listState.canScrollForward
                 if (listState.firstVisibleItemIndex == boundedTarget || (targetVisible && atEnd)) {
                     restored = true
                     break
@@ -3415,6 +3497,34 @@ private fun VerticalChapterView(
             if (restored) positionRestored = true
         }
     }
+    LaunchedEffect(
+        listState,
+        document.sourceUrl,
+        document.paragraphs,
+        previousChapter?.sourceUrl,
+        previousChapter?.paragraphs,
+        nextChapter?.sourceUrl,
+        nextChapter?.paragraphs,
+        currentStartIndex,
+        nextStartIndex
+    ) {
+        snapshotFlow {
+            positionRestored to VerticalViewport(
+                scrolling = listState.isScrollInProgress,
+                firstVisible = listState.layoutInfo.visibleItemsInfo.firstOrNull()?.index ?: -1,
+                firstOffset = listState.firstVisibleItemScrollOffset,
+                lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1,
+                canScrollBackward = listState.canScrollBackward,
+                canScrollForward = listState.canScrollForward
+            )
+        }
+            .distinctUntilChanged()
+            .collectLatest { (restored, viewport) ->
+                if (!restored || suppressBoundaryNavigation) return@collectLatest
+                positionForViewport(viewport)?.let { onPositionChange(it, false) }
+            }
+    }
+
     LaunchedEffect(
         listState,
         document.sourceUrl,
@@ -3446,36 +3556,15 @@ private fun VerticalChapterView(
                     skipInitialPositionSave = false
                     return@collectLatest
                 }
-                val index = listState.firstVisibleItemIndex
-                if (index < 0) return@collectLatest
-                val targetDocument: ReaderDocument
-                val relativeIndex: Int
-                when {
-                    nextChapter != null && index >= nextStartIndex -> {
-                        targetDocument = nextChapter
-                        relativeIndex = (index - nextStartIndex).coerceIn(0, nextChapter.paragraphs.size)
-                    }
-                    index >= currentStartIndex -> {
-                        targetDocument = document
-                        relativeIndex = (index - currentStartIndex).coerceIn(0, document.paragraphs.size)
-                    }
-                    previousChapter != null -> {
-                        targetDocument = previousChapter
-                        relativeIndex = index.coerceIn(0, previousChapter.paragraphs.size)
-                    }
-                    else -> {
-                        targetDocument = document
-                        relativeIndex = 0
-                    }
-                }
-                val offsets = paragraphStartOffsets(targetDocument)
-                val paragraphIndex = (relativeIndex - 1).coerceIn(0, max(0, targetDocument.paragraphs.size - 1))
-                val textOffset = offsets.getOrElse(paragraphIndex) { 0 }
-                preferences.edit()
-                    .putInt(progressKey(targetDocument.sourceUrl), relativeIndex)
-                    .putInt(progressOffsetKey(targetDocument.sourceUrl), textOffset)
-                    .apply()
-                onPositionChange(targetDocument.sourceUrl, textOffset)
+                val settledViewport = VerticalViewport(
+                    scrolling = false,
+                    firstVisible = listState.layoutInfo.visibleItemsInfo.firstOrNull()?.index ?: -1,
+                    firstOffset = listState.firstVisibleItemScrollOffset,
+                    lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1,
+                    canScrollBackward = listState.canScrollBackward,
+                    canScrollForward = listState.canScrollForward
+                )
+                positionForViewport(settledViewport)?.let { onPositionChange(it, true) }
             }
     }
     LaunchedEffect(
@@ -3606,7 +3695,7 @@ private fun HorizontalChapterView(
     chapterOpenPosition: ChapterOpenPosition?,
     nextChapter: ReaderDocument?,
     nextChapterReady: Boolean,
-    onPositionChange: (String, Int) -> Unit,
+    onPositionChange: (ReadingPositionSnapshot, Boolean) -> Unit,
     onNavigateChapter: (String, ChapterOpenPosition) -> Unit,
     onAutoNext: () -> Unit
 ) {
@@ -3696,13 +3785,16 @@ private fun HorizontalChapterView(
                     val contentPage = (if (inNextContent) page - pages.size else page)
                         .coerceIn(0, progressPages.lastIndex)
                     val textOffset = progressPages[contentPage].startOffset
-                    val progressKey = progressKey(progressDocument.sourceUrl) + "_horizontal"
-                    val progressOffsetKey = progressOffsetKey(progressDocument.sourceUrl)
-                    preferences.edit()
-                        .putInt(progressKey, contentPage)
-                        .putInt(progressOffsetKey, textOffset)
-                        .apply()
-                    onPositionChange(progressDocument.sourceUrl, textOffset)
+                    onPositionChange(
+                        ReadingPositionSnapshot(
+                            sourceUrl = progressDocument.sourceUrl,
+                            textOffset = textOffset,
+                            progressIndex = contentPage,
+                            progressIndexKey = progressKey(progressDocument.sourceUrl) + "_horizontal",
+                            viewportOffset = null
+                        ),
+                        true
+                    )
                 }
         }
 
@@ -4386,6 +4478,8 @@ private fun bookTitleForDocument(document: ReaderDocument, catalog: ReaderDocume
 private fun progressKey(url: String): String = "progress_" + url.hashCode().toUInt().toString(16)
 
 private fun progressOffsetKey(url: String): String = "progress_offset_" + url.hashCode().toUInt().toString(16)
+
+private fun progressViewportKey(url: String): String = "progress_viewport_" + url.hashCode().toUInt().toString(16)
 
 private fun paragraphStartOffsets(document: ReaderDocument): List<Int> {
     var offset = 0
