@@ -3864,7 +3864,7 @@ private fun HorizontalChapterView(
                                 target in 0 until totalPages -> {
                                     pagerScope.launch {
                                         if (target < current) {
-                                            pagerState.scrollToPage(target)
+                                            pagerState.animateScrollToPage(target)
                                         } else {
                                             pagerState.animateScrollToPage(target)
                                         }
@@ -3882,7 +3882,7 @@ private fun HorizontalChapterView(
                             val target = if (swipedRight) pageAtDown - 1 else pageAtDown + 1
                             when {
                                 target in 0 until totalPages -> {
-                                    pagerScope.launch { pagerState.scrollToPage(target) }
+                                    Unit
                                 }
                                 swipedRight && pageAtDown == 0 -> {
                                     document.navigation.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.END) }
