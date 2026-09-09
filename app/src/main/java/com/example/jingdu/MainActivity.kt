@@ -1989,7 +1989,14 @@ private fun JingduApp(initialUrl: String = "") {
                          if (persist && document?.sourceUrl?.let { current -> sameUrl(current, position.sourceUrl) } == true) {
                              readingOffset = position.textOffset
                          }
-                         if (persist) saveLatestReadingPosition()
+                         if (activeCatalogUrl.isNotEmpty()) {
+                              findCached(activeCatalogUrl)?.catalogItems?.indexOfFirst { item ->
+                                  sameUrl(item.href, position.sourceUrl)
+                              }?.takeIf { it >= 0 }?.let { index ->
+                                  activeCatalogIndex = index
+                              }
+                          }
+                          if (persist) saveLatestReadingPosition()
                      },
                     onNavigate = { openUrl(it) },
                     onNavigateChapter = { href, position ->
@@ -2963,9 +2970,10 @@ private fun CatalogDrawer(
             sameUrl(item.href, currentUrl) || sameChapter(item.label, currentTitle)
         } ?: -1
     }
-    val currentIndex = matchedIndex
+    val indexedPosition = catalogIndex?.takeIf { it in 0 until catalogItemCount }
+    val currentIndex = indexedPosition ?: matchedIndex
     val listState = rememberLazyListState()
-    var positionedOnce by remember { mutableStateOf(false) }
+    var positionedKey by remember(catalogDocument?.sourceUrl) { mutableStateOf("") }
     LaunchedEffect(
         catalogDocument?.sourceUrl,
         catalogItemCount,
@@ -2974,16 +2982,19 @@ private fun CatalogDrawer(
         currentTitle,
         currentIndex
     ) {
-        if (currentIndex >= 0 && !positionedOnce) {
-            positionedOnce = true
-            val targetIndex = currentIndex + 1
-            listState.scrollToItem(targetIndex)
-            val targetItem = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == targetIndex }
-            if (targetItem != null) {
-                val viewportHeight = (listState.layoutInfo.viewportEndOffset - listState.layoutInfo.viewportStartOffset)
-                    .coerceAtLeast(targetItem.size)
-                val centerOffset = -((viewportHeight - targetItem.size) / 2)
-                listState.scrollToItem(targetIndex, centerOffset)
+        if (currentIndex >= 0) {
+            val targetKey = "${catalogDocument?.sourceUrl}:$currentIndex"
+            if (positionedKey != targetKey) {
+                val targetIndex = currentIndex + 1
+                listState.scrollToItem(targetIndex)
+                val targetItem = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == targetIndex }
+                if (targetItem != null) {
+                    val viewportHeight = (listState.layoutInfo.viewportEndOffset - listState.layoutInfo.viewportStartOffset)
+                        .coerceAtLeast(targetItem.size)
+                    val centerOffset = -((viewportHeight - targetItem.size) / 2)
+                    listState.scrollToItem(targetIndex, centerOffset)
+                }
+                positionedKey = targetKey
             }
         }
     }
@@ -3444,9 +3455,7 @@ private fun VerticalChapterView(
         document.sourceUrl,
         chapterOpenPosition,
         verticalOpenIndex,
-        verticalOpenOffset,
-        currentStartIndex,
-        totalItemCount
+        verticalOpenOffset
     ) {
         positionRestored = false
         skipInitialPositionSave = true
@@ -3605,40 +3614,28 @@ private fun VerticalChapterView(
                 if (firstVisible < 0 || viewport.scrolling) return@collectLatest
                 if (scrollGeneration <= lastHandledUserScrollGeneration) return@collectLatest
                 lastHandledUserScrollGeneration = scrollGeneration
-                if (nextChapter == null && viewport.lastVisible >= currentEndIndex && !viewport.canScrollForward) {
-                    onAutoNext()
-                    return@collectLatest
-                }
-                val nextChapterVisibleAtEnd = nextChapter != null &&
-                    firstVisible < nextStartIndex &&
-                    viewport.lastVisible >= nextStartIndex &&
-                    !viewport.canScrollForward
-                if (nextChapterVisibleAtEnd) {
-                    document.navigation.next?.let {
-                        onContinueToChapter(it.href, 0, 0)
-                    }
-                    return@collectLatest
-                }
-                val inPreviousChapter = previousChapter != null && firstVisible in 0 until currentStartIndex
-                val inNextChapter = nextChapter != null && firstVisible >= nextStartIndex
-                when {
-                    inPreviousChapter -> {
-                        document.navigation.previous?.let {
-                            onContinueToChapter(
-                                it.href,
-                                firstVisible.coerceIn(0, previousChapter?.paragraphs?.size ?: 0),
-                                viewport.firstOffset
-                            )
+                if (!viewport.canScrollForward) {
+                    if (nextChapter == null) {
+                        if (viewport.lastVisible >= currentEndIndex) {
+                            onAutoNext()
+                            return@collectLatest
                         }
-                    }
-                    inNextChapter -> {
+                    } else {
                         document.navigation.next?.let {
-                            onContinueToChapter(
-                                it.href,
-                                (firstVisible - nextStartIndex).coerceIn(0, nextChapter?.paragraphs?.size ?: 0),
-                                viewport.firstOffset
-                            )
+                            val nextIndex = if (firstVisible >= nextStartIndex) {
+                                (firstVisible - nextStartIndex).coerceIn(0, nextChapter.paragraphs.size)
+                            } else {
+                                0
+                            }
+                            val nextOffset = if (firstVisible >= nextStartIndex) viewport.firstOffset else 0
+                            onContinueToChapter(it.href, nextIndex, nextOffset)
                         }
+                        return@collectLatest
+                    }
+                }
+                if (!viewport.canScrollBackward && previousChapter != null) {
+                    document.navigation.previous?.let {
+                        onContinueToChapter(it.href, 0, 0)
                     }
                 }
             }
