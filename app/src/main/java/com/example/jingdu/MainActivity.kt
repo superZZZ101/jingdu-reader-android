@@ -121,6 +121,7 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 private enum class AppScreen { HOME, READER, BOOKSHELF }
 private enum class ReaderTheme { IVORY, PAPER, NIGHT }
@@ -3707,10 +3708,13 @@ private fun HorizontalChapterView(
     ) {
         val density = androidx.compose.ui.platform.LocalDensity.current
         val textMeasurer = rememberTextMeasurer()
-        val contentWidthPx = with(density) { (maxWidth - HorizontalPageHorizontalPadding * 2).toPx().toInt() }
-            .coerceAtLeast(1)
+        val contentWidthPx = with(density) {
+            maxWidth.toPx().roundToInt() - HorizontalPageHorizontalPadding.toPx().roundToInt() * 2
+        }.coerceAtLeast(1)
         val contentHeightPx = with(density) {
-            (maxHeight - HorizontalPageTopPadding - HorizontalPageBottomPadding).toPx().toInt()
+            maxHeight.toPx().roundToInt() -
+                HorizontalPageTopPadding.toPx().roundToInt() -
+                HorizontalPageBottomPadding.toPx().roundToInt()
         }.coerceAtLeast(1)
         val headerHeightPx = remember(document.sourceUrl, document.title, contentWidthPx) {
             horizontalHeaderHeightPx(document, textMeasurer, density, contentWidthPx)
@@ -3956,9 +3960,10 @@ private fun horizontalHeaderHeightPx(
         TextStyle(fontSize = 12.sp)
     )
     val spacing = with(density) {
-        (12.dp.toPx() + 10.dp.toPx() + 19.dp.toPx() + 2.dp.toPx() + 13.dp.toPx()).toInt()
+        listOf(12.dp, 10.dp, 19.dp, 2.dp, 13.dp)
+            .sumOf { it.toPx().roundToInt() }
     }
-    val safety = with(density) { 2.dp.toPx().toInt().coerceAtLeast(1) }
+    val safety = with(density) { 2.dp.toPx().roundToInt().coerceAtLeast(1) }
     return labelHeight + titleHeight + metadataHeight + spacing + safety
 }
 
@@ -4016,7 +4021,7 @@ private fun paginateChapterPages(
     )
     val fullText = document.paragraphs.joinToString("\n\n").trim()
     val textSafetyPx = with(density) {
-        HorizontalPageTextBottomSafety.toPx().toInt().coerceAtLeast(1)
+        HorizontalPageTextBottomSafety.toPx().roundToInt().coerceAtLeast(1)
     }
     val firstHeight = (contentHeightPx - headerHeightPx - textSafetyPx).coerceAtLeast(1)
     val normalHeight = (contentHeightPx - textSafetyPx).coerceAtLeast(1)
