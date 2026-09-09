@@ -1995,16 +1995,18 @@ private fun JingduApp(initialUrl: String = "") {
                         activity?.requestedOrientation = updatedSettings.screenOrientation.toRequestedOrientation()
                     },
                     onPositionChange = { position, persist ->
-                         latestReadingPosition.value = position
+                         val catalogPositionChanged = latestReadingPosition.value?.let { previous ->
+                              !sameUrl(previous.sourceUrl, position.sourceUrl)
+                          } ?: true
+                          latestReadingPosition.value = position
                          if (persist && document?.sourceUrl?.let { current -> sameUrl(current, position.sourceUrl) } == true) {
                              readingOffset = position.textOffset
                          }
-                         if (activeCatalogUrl.isNotEmpty()) {
-                               activeCatalogIndex = null
+                         if (persist && catalogPositionChanged && activeCatalogUrl.isNotEmpty()) {
                               findCached(activeCatalogUrl)?.catalogItems?.indexOfFirst { item ->
                                   catalogItemMatches(item, position.sourceUrl, position.chapterTitle)
                               }?.takeIf { it >= 0 }?.let { index ->
-                                  activeCatalogIndex = index
+                                  if (activeCatalogIndex != index) activeCatalogIndex = index
                               }
                           }
                           if (persist) saveLatestReadingPosition()
@@ -3417,7 +3419,13 @@ private fun VerticalChapterView(
     val listState = rememberLazyListState()
     val context = androidx.compose.ui.platform.LocalContext.current
     val preferences = remember { context.getSharedPreferences("jingdu", 0) }
+    val previousParagraphOffsets = remember(previousChapter?.sourceUrl, previousChapter?.paragraphs) {
+        previousChapter?.let { paragraphStartOffsets(it) }.orEmpty()
+    }
     val currentParagraphOffsets = remember(document.sourceUrl, document.paragraphs) { paragraphStartOffsets(document) }
+    val nextParagraphOffsets = remember(nextChapter?.sourceUrl, nextChapter?.paragraphs) {
+        nextChapter?.let { paragraphStartOffsets(it) }.orEmpty()
+    }
     var positionRestored by remember(document.sourceUrl) { mutableStateOf(false) }
     var skipInitialPositionSave by remember(document.sourceUrl) { mutableStateOf(false) }
     val previousItemCount = previousChapter?.let { it.paragraphs.size + 1 } ?: 0
@@ -3431,27 +3439,27 @@ private fun VerticalChapterView(
     fun positionForViewport(viewport: VerticalViewport): ReadingPositionSnapshot? {
         val index = viewport.firstVisible
         if (index < 0) return null
-        val targetDocument: ReaderDocument
-        val relativeIndex: Int
-        when {
-            nextChapter != null && index >= nextStartIndex -> {
-                targetDocument = nextChapter
-                relativeIndex = (index - nextStartIndex).coerceIn(0, nextChapter.paragraphs.size)
-            }
-            index >= currentStartIndex -> {
-                targetDocument = document
-                relativeIndex = (index - currentStartIndex).coerceIn(0, document.paragraphs.size)
-            }
-            previousChapter != null -> {
-                targetDocument = previousChapter
-                relativeIndex = index.coerceIn(0, previousChapter.paragraphs.size)
-            }
-            else -> {
-                targetDocument = document
-                relativeIndex = 0
-            }
+        val target = when {
+            nextChapter != null && index >= nextStartIndex -> Triple(
+                nextChapter,
+                (index - nextStartIndex).coerceIn(0, nextChapter.paragraphs.size),
+                nextParagraphOffsets
+            )
+            index >= currentStartIndex -> Triple(
+                document,
+                (index - currentStartIndex).coerceIn(0, document.paragraphs.size),
+                currentParagraphOffsets
+            )
+            previousChapter != null -> Triple(
+                previousChapter,
+                index.coerceIn(0, previousChapter.paragraphs.size),
+                previousParagraphOffsets
+            )
+            else -> Triple(document, 0, currentParagraphOffsets)
         }
-        val offsets = paragraphStartOffsets(targetDocument)
+        val targetDocument = target.first
+        val relativeIndex = target.second
+        val offsets = target.third
         val paragraphIndex = (relativeIndex - 1).coerceIn(0, max(0, targetDocument.paragraphs.size - 1))
         return ReadingPositionSnapshot(
             sourceUrl = targetDocument.sourceUrl,
@@ -3517,33 +3525,6 @@ private fun VerticalChapterView(
             suppressBoundaryNavigation = false
             if (restored) positionRestored = true
         }
-    }
-    LaunchedEffect(
-        listState,
-        document.sourceUrl,
-        document.paragraphs,
-        previousChapter?.sourceUrl,
-        previousChapter?.paragraphs,
-        nextChapter?.sourceUrl,
-        nextChapter?.paragraphs,
-        currentStartIndex,
-        nextStartIndex
-    ) {
-        snapshotFlow {
-            positionRestored to VerticalViewport(
-                scrolling = listState.isScrollInProgress,
-                firstVisible = listState.layoutInfo.visibleItemsInfo.firstOrNull()?.index ?: -1,
-                firstOffset = listState.firstVisibleItemScrollOffset,
-                lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1,
-                canScrollBackward = listState.canScrollBackward,
-                canScrollForward = listState.canScrollForward
-            )
-        }
-            .distinctUntilChanged()
-            .collectLatest { (restored, viewport) ->
-                if (!restored || suppressBoundaryNavigation) return@collectLatest
-                positionForViewport(viewport)?.let { onPositionChange(it, false) }
-            }
     }
 
     LaunchedEffect(
