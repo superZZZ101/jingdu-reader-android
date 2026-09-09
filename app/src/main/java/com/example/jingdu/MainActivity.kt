@@ -68,6 +68,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -220,6 +221,12 @@ private val PendingChapterNavigationSaver = Saver<PendingChapterNavigation?, Any
 private data class ChapterPage(
     val text: String,
     val startOffset: Int
+)
+
+private data class HorizontalHeaderTextStyles(
+    val label: TextStyle,
+    val title: TextStyle,
+    val metadata: TextStyle
 )
 
 private data class ReadingPositionSnapshot(
@@ -3709,6 +3716,15 @@ private fun HorizontalChapterView(
     ) {
         val density = androidx.compose.ui.platform.LocalDensity.current
         val textMeasurer = rememberTextMeasurer()
+        val inheritedTextStyle = LocalTextStyle.current
+        val bodyTextStyle = inheritedTextStyle.merge(horizontalPageTextStyle(settings))
+        val headerTextStyles = HorizontalHeaderTextStyles(
+            label = inheritedTextStyle.merge(TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Bold)),
+            title = inheritedTextStyle.merge(
+                TextStyle(fontSize = 30.sp, fontWeight = FontWeight.Bold, lineHeight = 38.sp)
+            ),
+            metadata = inheritedTextStyle.merge(TextStyle(fontSize = 12.sp))
+        )
         val contentWidthPx = with(density) {
             maxWidth.toPx().roundToInt() - HorizontalPageHorizontalPadding.toPx().roundToInt() * 2
         }.coerceAtLeast(1)
@@ -3720,11 +3736,13 @@ private fun HorizontalChapterView(
                 HorizontalPageBottomPadding.toPx().roundToInt() -
                 HorizontalPagePaginationSafetyPx
         }.coerceAtLeast(1)
-        val headerHeightPx = remember(document.sourceUrl, document.title, contentWidthPx) {
-            horizontalHeaderHeightPx(document, textMeasurer, density, contentWidthPx)
+        val headerHeightPx = remember(document.sourceUrl, document.title, contentWidthPx, headerTextStyles) {
+            horizontalHeaderHeightPx(document, textMeasurer, density, contentWidthPx, headerTextStyles)
         }
-        val nextHeaderHeightPx = remember(nextChapter?.sourceUrl, nextChapter?.title, contentWidthPx) {
-            nextChapter?.let { horizontalHeaderHeightPx(it, textMeasurer, density, contentWidthPx) } ?: 0
+        val nextHeaderHeightPx = remember(nextChapter?.sourceUrl, nextChapter?.title, contentWidthPx, headerTextStyles) {
+            nextChapter?.let {
+                horizontalHeaderHeightPx(it, textMeasurer, density, contentWidthPx, headerTextStyles)
+            } ?: 0
         }
         val pages = remember(
             document.sourceUrl,
@@ -3733,9 +3751,10 @@ private fun HorizontalChapterView(
             settings.lineHeight,
             contentWidthPx,
             contentHeightPx,
-            headerHeightPx
+            headerHeightPx,
+            bodyTextStyle
         ) {
-            paginateChapterPages(document, textMeasurer, density, contentWidthPx, contentHeightPx, headerHeightPx, settings)
+            paginateChapterPages(document, textMeasurer, density, contentWidthPx, contentHeightPx, headerHeightPx, bodyTextStyle)
         }
         val hasNextChapter = document.navigation.next != null
         val nextPages = remember(
@@ -3745,11 +3764,14 @@ private fun HorizontalChapterView(
             settings.lineHeight,
             contentWidthPx,
             contentHeightPx,
-            nextHeaderHeightPx
+            nextHeaderHeightPx,
+            bodyTextStyle
         ) {
             nextChapter
                 ?.takeIf { nextChapterReady && !it.isCatalog && it.paragraphs.isNotEmpty() }
-                ?.let { paginateChapterPages(it, textMeasurer, density, contentWidthPx, contentHeightPx, nextHeaderHeightPx, settings) }
+                ?.let {
+                    paginateChapterPages(it, textMeasurer, density, contentWidthPx, contentHeightPx, nextHeaderHeightPx, bodyTextStyle)
+                }
                 .orEmpty()
         }
         val showNextContent = hasNextChapter && nextPages.isNotEmpty()
@@ -3900,8 +3922,9 @@ private fun HorizontalChapterView(
                         text = nextPages[nextPage].text,
                         page = nextPage,
                         headerHeightPx = nextHeaderHeightPx,
-                        palette = palette,
-                        settings = settings
+                        headerTextStyles = headerTextStyles,
+                        textStyle = bodyTextStyle,
+                        palette = palette
                     )
                 } else {
                     HorizontalChapterPage(
@@ -3909,8 +3932,9 @@ private fun HorizontalChapterView(
                         text = pages[page].text,
                         page = page,
                         headerHeightPx = headerHeightPx,
-                        palette = palette,
-                        settings = settings
+                        headerTextStyles = headerTextStyles,
+                        textStyle = bodyTextStyle,
+                        palette = palette
                     )
                 }
             }
@@ -3944,7 +3968,8 @@ private fun horizontalHeaderHeightPx(
     document: ReaderDocument,
     textMeasurer: TextMeasurer,
     density: Density,
-    contentWidthPx: Int
+    contentWidthPx: Int,
+    textStyles: HorizontalHeaderTextStyles
 ): Int {
     fun measuredHeight(text: String, style: TextStyle): Int = textMeasurer.measure(
         text = AnnotatedString(text),
@@ -3955,17 +3980,11 @@ private fun horizontalHeaderHeightPx(
         constraints = Constraints(maxWidth = contentWidthPx.coerceAtLeast(1))
     ).size.height
 
-    val labelHeight = measuredHeight(
-        "静读 · 当前章节",
-        TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Bold)
-    )
-    val titleHeight = measuredHeight(
-        document.title.ifEmpty { " " },
-        TextStyle(fontSize = 30.sp, fontWeight = FontWeight.Bold, lineHeight = 38.sp)
-    )
+    val labelHeight = measuredHeight("静读 · 当前章节", textStyles.label)
+    val titleHeight = measuredHeight(document.title.ifEmpty { " " }, textStyles.title)
     val metadataHeight = measuredHeight(
         "${document.paragraphs.size} 段 · ${document.wordCount} 字",
-        TextStyle(fontSize = 12.sp)
+        textStyles.metadata
     )
     val spacing = with(density) {
         listOf(12.dp, 10.dp, 19.dp, 2.dp, 13.dp)
@@ -3981,8 +4000,9 @@ private fun HorizontalChapterPage(
     text: String,
     page: Int,
     headerHeightPx: Int,
-    palette: ReaderPalette,
-    settings: ReaderSettings
+    headerTextStyles: HorizontalHeaderTextStyles,
+    textStyle: TextStyle,
+    palette: ReaderPalette
 ) {
     Column(
         modifier = Modifier
@@ -3997,7 +4017,12 @@ private fun HorizontalChapterPage(
         if (page == 0) {
             val headerHeight = with(androidx.compose.ui.platform.LocalDensity.current) { headerHeightPx.toDp() }
             Box(modifier = Modifier.height(headerHeight)) {
-                ChapterHeader(document, palette, titleMaxLines = Int.MAX_VALUE)
+                ChapterHeader(
+                    document = document,
+                    palette = palette,
+                    titleMaxLines = Int.MAX_VALUE,
+                    textStyles = headerTextStyles
+                )
             }
         }
         Text(
@@ -4006,7 +4031,10 @@ private fun HorizontalChapterPage(
                 .fillMaxWidth()
                 .padding(bottom = HorizontalPageTextBottomSafety),
             color = palette.ink,
-            style = horizontalPageTextStyle(settings)
+            style = textStyle,
+            softWrap = true,
+            maxLines = Int.MAX_VALUE,
+            overflow = TextOverflow.Clip
         )
     }
 }
@@ -4025,9 +4053,9 @@ private fun paginateChapterPages(
     contentWidthPx: Int,
     contentHeightPx: Int,
     headerHeightPx: Int,
-    settings: ReaderSettings
+    textStyle: TextStyle
 ): List<ChapterPage> {
-    val style = horizontalPageTextStyle(settings)
+    val style = textStyle
     val fullText = normalizeReaderParagraphs(document.paragraphs)
         .joinToString("\n\n")
         .trim()
@@ -4211,23 +4239,12 @@ private fun fitTextPrefix(
         }
     }
     if (lastFittingLine >= 0) {
-        // Move the preceding prose line too, so a trailing mark stays beside context on the next page.
-        var safeLine = lastFittingLine
-        var movedSymbolLine = false
-        while (safeLine > 0) {
-            val lineStart = fullLayout.getLineStart(safeLine)
-            val lineEnd = fullLayout.getLineEnd(safeLine, visibleEnd = true)
-            if (!isSymbolOnlyLine(text.substring(lineStart, lineEnd))) break
-            safeLine -= 1
-            movedSymbolLine = true
-        }
-        if (movedSymbolLine) safeLine = (safeLine - 1).coerceAtLeast(0)
-
-        while (safeLine >= 0) {
-            val candidate = fullLayout.getLineEnd(safeLine, visibleEnd = true)
+        var candidateLine = lastFittingLine
+        while (candidateLine >= 0) {
+            val candidate = fullLayout.getLineEnd(candidateLine, visibleEnd = true)
                 .coerceIn(1, text.length)
             if (fits(candidate)) return candidate
-            safeLine -= 1
+            candidateLine -= 1
         }
     }
 
@@ -4244,11 +4261,6 @@ private fun fitTextPrefix(
         }
     }
     return best.coerceAtMost(text.length)
-}
-
-private fun isSymbolOnlyLine(text: String): Boolean {
-    val visible = text.filterNot { it.isWhitespace() }
-    return visible.isNotEmpty() && visible.all { !it.isLetterOrDigit() }
 }
 
 private fun splitTextAtBoundary(
@@ -4287,22 +4299,33 @@ private fun AutoNextView(palette: ReaderPalette) {
 private fun ChapterHeader(
     document: ReaderDocument,
     palette: ReaderPalette,
-    titleMaxLines: Int = 2
+    titleMaxLines: Int = 2,
+    textStyles: HorizontalHeaderTextStyles? = null
 ) {
+    val inheritedTextStyle = LocalTextStyle.current
+    val resolvedStyles = textStyles ?: HorizontalHeaderTextStyles(
+        label = inheritedTextStyle.merge(TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Bold)),
+        title = inheritedTextStyle.merge(
+            TextStyle(fontSize = 30.sp, fontWeight = FontWeight.Bold, lineHeight = 38.sp)
+        ),
+        metadata = inheritedTextStyle.merge(TextStyle(fontSize = 12.sp))
+    )
     Column {
-        Text("静读 · 当前章节", color = palette.accent, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        Text("静读 · 当前章节", color = palette.accent, style = resolvedStyles.label)
         Spacer(Modifier.height(12.dp))
         Text(
             document.title,
             color = palette.ink,
-            fontSize = 30.sp,
-            fontWeight = FontWeight.Bold,
-            lineHeight = 38.sp,
+            style = resolvedStyles.title,
             maxLines = titleMaxLines,
             overflow = TextOverflow.Ellipsis
         )
         Spacer(Modifier.height(10.dp))
-        Text("${document.paragraphs.size} 段 · ${document.wordCount} 字", color = palette.muted, fontSize = 12.sp)
+        Text(
+            "${document.paragraphs.size} 段 · ${document.wordCount} 字",
+            color = palette.muted,
+            style = resolvedStyles.metadata
+        )
         Spacer(Modifier.height(19.dp))
         Box(modifier = Modifier.width(44.dp).height(2.dp).background(palette.accent))
         Spacer(Modifier.height(13.dp))
