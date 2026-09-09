@@ -112,6 +112,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -3214,7 +3215,7 @@ private fun Modifier.horizontalPageGestureDetector(
     currentPage: () -> Int,
     onUserGesture: () -> Unit,
     onTap: (tappedLeft: Boolean) -> Unit,
-    onSwipe: (swipedRight: Boolean, pageAtDown: Int) -> Unit
+    onSwipe: (swipedRight: Boolean, pageAtDown: Int, passedSnapThreshold: Boolean) -> Unit
 ): Modifier = pointerInput(key) {
     awaitEachGesture {
         val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Final)
@@ -3237,7 +3238,11 @@ private fun Modifier.horizontalPageGestureDetector(
         val horizontalSwipe = moved && kotlin.math.abs(delta.x) > kotlin.math.abs(delta.y)
         if (horizontalSwipe) {
             onUserGesture()
-            onSwipe(delta.x > 0f, pageAtDown)
+            onSwipe(
+                delta.x > 0f,
+                pageAtDown,
+                kotlin.math.abs(delta.x) >= size.width * HorizontalPageSnapPositionalThreshold
+            )
         } else if (!moved && !consumed) {
             when {
                 start.x < size.width * ReaderMenuTapStartFraction -> {
@@ -3847,7 +3852,7 @@ private fun HorizontalChapterView(
                 state = pagerState,
                 flingBehavior = PagerDefaults.flingBehavior(
                     state = pagerState,
-                    snapPositionalThreshold = 0.10f
+                    snapPositionalThreshold = HorizontalPageSnapPositionalThreshold
                 ),
                 modifier = Modifier
                     .fillMaxSize()
@@ -3880,11 +3885,19 @@ private fun HorizontalChapterView(
                                 }
                             }
                         },
-                        onSwipe = { swipedRight, pageAtDown ->
+                        onSwipe = { swipedRight, pageAtDown, passedSnapThreshold ->
                             val target = if (swipedRight) pageAtDown - 1 else pageAtDown + 1
                             when {
-                                target in 0 until totalPages -> {
-                                    Unit
+                                target in 0 until totalPages &&
+                                    passedSnapThreshold && pagerState.currentPage == pageAtDown -> {
+                                    pagerScope.launch {
+                                        if (pagerState.isScrollInProgress) {
+                                            snapshotFlow { pagerState.isScrollInProgress }.first { scrolling -> !scrolling }
+                                        }
+                                        if (pagerState.currentPage == pageAtDown) {
+                                            pagerState.animateScrollToPage(target)
+                                        }
+                                    }
                                 }
                                 swipedRight && pageAtDown == 0 -> {
                                     document.navigation.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.END) }
@@ -3942,6 +3955,7 @@ private val HorizontalPageHorizontalPadding = 22.dp
 private val HorizontalPageTopPadding = 64.dp
 private val HorizontalPageBottomPadding = 42.dp
 private val HorizontalPageIndicatorHeight = 24.dp
+private const val HorizontalPageSnapPositionalThreshold = 0.05f
 private const val HorizontalPagePaginationSafetyPx = 2
 private val HorizontalPageTextBottomSafety = 1.dp
 
