@@ -222,6 +222,7 @@ private data class ChapterPage(
 
 private data class ReadingPositionSnapshot(
     val sourceUrl: String,
+    val chapterTitle: String,
     val textOffset: Int,
     val progressIndex: Int,
     val progressIndexKey: String,
@@ -1990,8 +1991,9 @@ private fun JingduApp(initialUrl: String = "") {
                              readingOffset = position.textOffset
                          }
                          if (activeCatalogUrl.isNotEmpty()) {
+                               activeCatalogIndex = null
                               findCached(activeCatalogUrl)?.catalogItems?.indexOfFirst { item ->
-                                  sameUrl(item.href, position.sourceUrl)
+                                  catalogItemMatches(item, position.sourceUrl, position.chapterTitle)
                               }?.takeIf { it >= 0 }?.let { index ->
                                   activeCatalogIndex = index
                               }
@@ -2967,7 +2969,7 @@ private fun CatalogDrawer(
         currentTitle
     ) {
         catalogDocument?.catalogItems?.indexOfFirst { item ->
-            sameUrl(item.href, currentUrl) || sameChapter(item.label, currentTitle)
+            catalogItemMatches(item, currentUrl, currentTitle)
         } ?: -1
     }
     val indexedPosition = catalogIndex?.takeIf { it in 0 until catalogItemCount }
@@ -3444,6 +3446,7 @@ private fun VerticalChapterView(
         val paragraphIndex = (relativeIndex - 1).coerceIn(0, max(0, targetDocument.paragraphs.size - 1))
         return ReadingPositionSnapshot(
             sourceUrl = targetDocument.sourceUrl,
+            chapterTitle = targetDocument.title,
             textOffset = offsets.getOrElse(paragraphIndex) { 0 },
             progressIndex = relativeIndex,
             progressIndexKey = progressKey(targetDocument.sourceUrl),
@@ -3785,6 +3788,7 @@ private fun HorizontalChapterView(
                     onPositionChange(
                         ReadingPositionSnapshot(
                             sourceUrl = progressDocument.sourceUrl,
+                            chapterTitle = progressDocument.title,
                             textOffset = textOffset,
                             progressIndex = contentPage,
                             progressIndexKey = progressKey(progressDocument.sourceUrl) + "_horizontal",
@@ -4419,6 +4423,11 @@ private fun sameReaderLoadUrl(first: String, second: String): Boolean {
         .sorted()
         .map { name -> "$name=${uri.getQueryParameter(name).orEmpty()}" }
     return stableQuery(left) == stableQuery(right)
+}
+
+private fun catalogItemMatches(item: ReaderLink, sourceUrl: String, chapterTitle: String): Boolean {
+    return sameReaderLoadUrl(item.href, sourceUrl) ||
+        (chapterTitle.isNotBlank() && sameChapter(item.label, chapterTitle))
 }
 
 private fun sameChapter(first: String, second: String): Boolean {
