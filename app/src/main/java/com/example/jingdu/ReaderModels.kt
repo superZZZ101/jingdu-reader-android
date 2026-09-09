@@ -109,7 +109,9 @@ fun parseReaderPayload(raw: String): ReaderDocument? {
     }.getOrNull() ?: return null
     val json = runCatching { JSONObject(payload) }.getOrNull() ?: return null
     val navigation = json.optJSONObject("navigation")
-    val paragraphs = json.optStringList("paragraphs").filterNot(::isReaderNoiseParagraph)
+    val paragraphs = normalizeReaderParagraphs(
+        json.optStringList("paragraphs").filterNot(::isReaderNoiseParagraph)
+    )
     val catalogItems = json.optLinkList("catalogItems")
     val catalogPages = json.optLinkList("catalogPages")
     val rawTitle = json.optString("title", "未识别标题")
@@ -169,6 +171,38 @@ fun cleanChapterTitle(raw: String): String {
     }
     title = title.replace(Regex("\\s*[-|｜·•]\\s*[^-|｜·•]*(?:小说|阅读|免费|网站|网).*$", RegexOption.IGNORE_CASE), "")
     return title.trim().ifEmpty { raw.trim().ifEmpty { "未识别标题" } }
+}
+
+private const val StandaloneSymbolParagraphMaxCharacters = 8
+private const val OpeningSymbolCharacters = "“‘「『《〈（【〔〖〘〝﹁﹃([{<\"'"
+
+fun normalizeReaderParagraphs(paragraphs: List<String>): List<String> {
+    val normalized = mutableListOf<String>()
+    var pendingPrefix = ""
+
+    paragraphs.forEach { raw ->
+        val text = raw.trim()
+        if (text.isEmpty()) return@forEach
+        val visible = text.filterNot { it.isWhitespace() }
+        val standaloneSymbol = visible.length <= StandaloneSymbolParagraphMaxCharacters &&
+            visible.isNotEmpty() && visible.all { !it.isLetterOrDigit() }
+        if (!standaloneSymbol) {
+            normalized += pendingPrefix + text
+            pendingPrefix = ""
+        } else if (visible.all { it in OpeningSymbolCharacters } || normalized.isEmpty()) {
+            // Opening quotes and leading marks belong with the following prose.
+            pendingPrefix += text
+        } else {
+            // Closing marks belong with the prose immediately before them.
+            normalized[normalized.lastIndex] += text
+        }
+    }
+
+    if (pendingPrefix.isNotEmpty()) {
+        if (normalized.isEmpty()) normalized += pendingPrefix
+        else normalized[normalized.lastIndex] += pendingPrefix
+    }
+    return normalized
 }
 
 private fun isReaderNoiseParagraph(raw: String): Boolean {
@@ -233,7 +267,9 @@ private fun JSONObject.toCachedReaderDocument(): ReaderDocument? {
     val sourceUrl = optString("sourceUrl").trim()
     if (sourceUrl.isEmpty()) return null
     val navigation = optJSONObject("navigation")
-    val paragraphs = optStringList("paragraphs").filterNot(::isReaderNoiseParagraph)
+    val paragraphs = normalizeReaderParagraphs(
+        optStringList("paragraphs").filterNot(::isReaderNoiseParagraph)
+    )
     val catalogItems = optLinkList("catalogItems")
     val catalogPages = optLinkList("catalogPages")
     val rawTitle = optString("title", "未识别标题")

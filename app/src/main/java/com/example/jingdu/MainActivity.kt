@@ -100,6 +100,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.style.LineBreak
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Density
@@ -152,7 +153,7 @@ private fun mergePagedDocuments(base: ReaderDocument, continuation: ReaderDocume
     val title = cleanChapterTitle(base.title)
     return base.copy(
         title = title,
-        paragraphs = base.paragraphs + continuation.paragraphs,
+        paragraphs = normalizeReaderParagraphs(base.paragraphs + continuation.paragraphs),
         navigation = ReaderNavigation(
             previous = baseNavigation.previous ?: continuationNavigation.previous,
             next = continuationNavigation.next ?: baseNavigation.next,
@@ -3711,10 +3712,13 @@ private fun HorizontalChapterView(
         val contentWidthPx = with(density) {
             maxWidth.toPx().roundToInt() - HorizontalPageHorizontalPadding.toPx().roundToInt() * 2
         }.coerceAtLeast(1)
+        val pageIndicatorHeightPx = with(density) { HorizontalPageIndicatorHeight.toPx().roundToInt() }
         val contentHeightPx = with(density) {
             maxHeight.toPx().roundToInt() -
+                pageIndicatorHeightPx -
                 HorizontalPageTopPadding.toPx().roundToInt() -
-                HorizontalPageBottomPadding.toPx().roundToInt()
+                HorizontalPageBottomPadding.toPx().roundToInt() -
+                HorizontalPagePaginationSafetyPx
         }.coerceAtLeast(1)
         val headerHeightPx = remember(document.sourceUrl, document.title, contentWidthPx) {
             horizontalHeaderHeightPx(document, textMeasurer, density, contentWidthPx)
@@ -3834,8 +3838,9 @@ private fun HorizontalChapterView(
                 }
         }
 
-        Box(modifier = Modifier.fillMaxSize()) {
-            HorizontalPager(
+        Column(modifier = Modifier.fillMaxSize()) {
+            Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                HorizontalPager(
                 state = pagerState,
                 flingBehavior = PagerDefaults.flingBehavior(
                     state = pagerState,
@@ -3862,13 +3867,7 @@ private fun HorizontalChapterView(
                             }
                             when {
                                 target in 0 until totalPages -> {
-                                    pagerScope.launch {
-                                        if (target < current) {
-                                            pagerState.animateScrollToPage(target)
-                                        } else {
-                                            pagerState.animateScrollToPage(target)
-                                        }
-                                    }
+                                    pagerScope.launch { pagerState.animateScrollToPage(target) }
                                 }
                                 tappedLeft && settings.horizontalTapMode == HorizontalTapMode.SIDE_PAGES && current == 0 -> {
                                     document.navigation.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.END) }
@@ -3915,13 +3914,20 @@ private fun HorizontalChapterView(
                     )
                 }
             }
-            if (pagerState.currentPage < pages.size) {
-                Text(
-                    "${pagerState.currentPage + 1} / ${pages.size}",
-                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp),
-                    color = palette.muted,
-                    fontSize = 10.sp
-                )
+            }
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(HorizontalPageIndicatorHeight),
+                contentAlignment = Alignment.Center
+            ) {
+                if (pagerState.currentPage < pages.size) {
+                    Text(
+                        "${pagerState.currentPage + 1} / ${pages.size}",
+                        color = palette.muted,
+                        fontSize = 10.sp
+                    )
+                }
             }
         }
     }
@@ -3930,6 +3936,8 @@ private fun HorizontalChapterView(
 private val HorizontalPageHorizontalPadding = 22.dp
 private val HorizontalPageTopPadding = 64.dp
 private val HorizontalPageBottomPadding = 42.dp
+private val HorizontalPageIndicatorHeight = 24.dp
+private const val HorizontalPagePaginationSafetyPx = 2
 private val HorizontalPageTextBottomSafety = 1.dp
 
 private fun horizontalHeaderHeightPx(
@@ -3998,12 +4006,17 @@ private fun HorizontalChapterPage(
                 .fillMaxWidth()
                 .padding(bottom = HorizontalPageTextBottomSafety),
             color = palette.ink,
-            fontSize = settings.fontSize.sp,
-            lineHeight = (settings.fontSize * settings.lineHeight).sp,
-            fontFamily = FontFamily.Serif
+            style = horizontalPageTextStyle(settings)
         )
     }
 }
+
+private fun horizontalPageTextStyle(settings: ReaderSettings): TextStyle = TextStyle(
+    fontSize = settings.fontSize.sp,
+    lineHeight = (settings.fontSize * settings.lineHeight).sp,
+    fontFamily = FontFamily.Serif,
+    lineBreak = LineBreak.Paragraph
+)
 
 private fun paginateChapterPages(
     document: ReaderDocument,
@@ -4014,12 +4027,10 @@ private fun paginateChapterPages(
     headerHeightPx: Int,
     settings: ReaderSettings
 ): List<ChapterPage> {
-    val style = TextStyle(
-        fontSize = settings.fontSize.sp,
-        lineHeight = (settings.fontSize * settings.lineHeight).sp,
-        fontFamily = FontFamily.Serif
-    )
-    val fullText = document.paragraphs.joinToString("\n\n").trim()
+    val style = horizontalPageTextStyle(settings)
+    val fullText = normalizeReaderParagraphs(document.paragraphs)
+        .joinToString("\n\n")
+        .trim()
     val textSafetyPx = with(density) {
         HorizontalPageTextBottomSafety.toPx().roundToInt().coerceAtLeast(1)
     }
@@ -4200,8 +4211,24 @@ private fun fitTextPrefix(
         }
     }
     if (lastFittingLine >= 0) {
-        return fullLayout.getLineEnd(lastFittingLine, visibleEnd = true)
-            .coerceIn(1, text.length)
+        // Move the preceding prose line too, so a trailing mark stays beside context on the next page.
+        var safeLine = lastFittingLine
+        var movedSymbolLine = false
+        while (safeLine > 0) {
+            val lineStart = fullLayout.getLineStart(safeLine)
+            val lineEnd = fullLayout.getLineEnd(safeLine, visibleEnd = true)
+            if (!isSymbolOnlyLine(text.substring(lineStart, lineEnd))) break
+            safeLine -= 1
+            movedSymbolLine = true
+        }
+        if (movedSymbolLine) safeLine = (safeLine - 1).coerceAtLeast(0)
+
+        while (safeLine >= 0) {
+            val candidate = fullLayout.getLineEnd(safeLine, visibleEnd = true)
+                .coerceIn(1, text.length)
+            if (fits(candidate)) return candidate
+            safeLine -= 1
+        }
     }
 
     var low = 1
@@ -4219,10 +4246,15 @@ private fun fitTextPrefix(
     return best.coerceAtMost(text.length)
 }
 
+private fun isSymbolOnlyLine(text: String): Boolean {
+    val visible = text.filterNot { it.isWhitespace() }
+    return visible.isNotEmpty() && visible.all { !it.isLetterOrDigit() }
+}
+
 private fun splitTextAtBoundary(
     text: String,
     requestedLength: Int,
-    maxBacktrackCharacters: Int = 48
+    maxBacktrackCharacters: Int = 0
 ): Pair<String, String> {
     if (text.isEmpty()) return "" to ""
     var cut = requestedLength.coerceIn(1, text.length)
