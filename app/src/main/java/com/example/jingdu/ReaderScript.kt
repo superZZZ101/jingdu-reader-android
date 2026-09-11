@@ -9,36 +9,45 @@ object ReaderScript {
     """.trimIndent()
 
     // Collects search result entries so the search tab can offer "save to shelf" without opening a
-    // dedicated API. Handles Bing/Baidu style result blocks, then falls back to a generic pass.
+    // dedicated API. Handles Bing/Baidu result blocks, then falls back to a generic pass.
     val searchResults = """
         (() => {
           const out = [];
           const seen = new Set();
+          const engine = /bing\./i.test(location.host) ? 'bing' : (/baidu\./i.test(location.host) ? 'baidu' : 'other');
+          const blocked = /bing\.com|baidu\.com|google\.|microsoft\.com|msn\.com|w3\.org|schema\.org|creativecommons|mozilla\.org/;
           const push = (title, href) => {
             const name = String(title || '').replace(/\s+/g, ' ').trim();
             if (!name || name.length < 2 || name.length > 90) return;
             if (!href || !/^https?:/i.test(href)) return;
-            if (/bing\.com|baidu\.com|google\.|microsoft\.com|msn\.com/.test(href)) return;
+            if (blocked.test(href)) return;
             if (seen.has(href)) return;
             seen.add(href);
             out.push({ title: name, href });
           };
-          document.querySelectorAll('#b_results > li.b_algo, .result, .c-container').forEach((block) => {
-            const anchor = block.querySelector('h2 a[href], h3 a[href], a[href]');
+          const blocks = document.querySelectorAll(
+            '#b_results > li.b_algo, #b_results > li.b_ans, #b_results > li, .b_algo, .result, .c-container, .result-op'
+          );
+          blocks.forEach((block) => {
+            const anchors = block.querySelectorAll('h2 a[href], h3 a[href], a[href]');
+            let anchor = null;
+            for (const candidate of anchors) {
+              if (!blocked.test(candidate.href || '')) { anchor = candidate; break; }
+            }
             if (!anchor) return;
             const heading = block.querySelector('h2, h3');
-            push(heading ? heading.textContent : anchor.textContent, anchor.href);
+            const headingText = heading ? heading.textContent : '';
+            const cite = block.querySelector('cite');
+            const citeText = cite ? cite.textContent : '';
+            // Prefer the headline, but fall back to the cited site name so ads and cards still count.
+            push(headingText || citeText || anchor.textContent, anchor.href);
           });
-          if (!out.length) {
-            document.querySelectorAll('a[href]').forEach((anchor) => {
-              const heading = anchor.querySelector('h3,h2');
-              const href = anchor.href || '';
-              if (!heading) return;
-              if (!/^https?:/i.test(href)) return;
-              push(heading.textContent, href);
+          if (out.length < 5) {
+            document.querySelectorAll('h2 a[href], h3 a[href]').forEach((anchor) => {
+              push(anchor.textContent, anchor.href);
             });
           }
-          return JSON.stringify({ url: location.href, title: document.title || '', results: out.slice(0, 30) });
+          return JSON.stringify({ url: location.href, engine: engine, title: document.title || '', results: out.slice(0, 40) });
         })()
     """.trimIndent()
 

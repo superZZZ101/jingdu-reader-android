@@ -30,8 +30,9 @@ android {
         applicationId = "com.example.jingdu"
         minSdk = 26
         targetSdk = 35
-        versionCode = 60
-        versionName = "1.3.56"
+        versionCode = 61
+        versionName = "1.3.57"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     signingConfigs {
@@ -86,4 +87,9 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.webkit:webkit:1.12.1")
     debugImplementation("androidx.compose.ui:ui-tooling")
+    androidTestImplementation(platform("androidx.compose:compose-bom:2024.12.01"))
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
 }

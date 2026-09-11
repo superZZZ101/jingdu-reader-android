@@ -138,17 +138,21 @@ import kotlin.math.roundToInt
 private enum class AppScreen { HOME, READER, BOOKSHELF }
 
 // Main-area tabs shown in the bottom bar; the reader is a full-screen destination above them.
-private enum class HomeTab { HOME, SHELF, SEARCH, SETTINGS }
+private enum class HomeTab { SHELF, SEARCH, SETTINGS }
 
 private const val DefaultSearchSite = "www.weimangguo.com"
+// Debug-only intent extra: drives the directory drawer without taps on a physical device.
+private const val ExtraDebugCatalog = "jingdu_debug_catalog"
+// How many extra catalogue pages one "reached the bottom" batch may pull before asking again.
+private const val CatalogPageBatchSize = 5
 
 private data class SearchResult(val title: String, val href: String)
 
 private enum class SearchEngine { BING, BAIDU }
-private enum class ReaderTheme { IVORY, PAPER, NIGHT }
-private enum class PageMode { VERTICAL, HORIZONTAL }
-private enum class HorizontalTapMode { SIDE_PAGES, BOTH_NEXT }
-private enum class ScreenOrientation { PORTRAIT, LANDSCAPE, SYSTEM }
+internal enum class ReaderTheme { IVORY, PAPER, NIGHT }
+internal enum class PageMode { VERTICAL, HORIZONTAL }
+internal enum class HorizontalTapMode { SIDE_PAGES, BOTH_NEXT }
+internal enum class ScreenOrientation { PORTRAIT, LANDSCAPE, SYSTEM }
 private enum class ReaderPanel { NONE, SETTINGS, CATALOG }
 private enum class ChapterOpenPosition { START, END }
 
@@ -452,7 +456,7 @@ private fun shareDiagnosticReport(context: android.content.Context, report: Stri
     }
 }
 
-private data class ReaderSettings(
+internal data class ReaderSettings(
     val theme: ReaderTheme = ReaderTheme.IVORY,
     val fontSize: Int = 19,
     val lineHeight: Float = 1.95f,
@@ -461,7 +465,7 @@ private data class ReaderSettings(
     val screenOrientation: ScreenOrientation = ScreenOrientation.PORTRAIT
 )
 
-private data class ReaderPalette(
+internal data class ReaderPalette(
     val background: Color,
     val surface: Color,
     val ink: Color,
@@ -499,22 +503,34 @@ private val NightPalette = ReaderPalette(
 
 class MainActivity : ComponentActivity() {
     private val sharedUrlState = mutableStateOf("")
+    // Debug-only: "open" opens the directory without taps, "crawl" also asks for the next batch.
+    private val debugCatalogActionState = mutableStateOf("")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestedOrientation = loadScreenOrientation(getSharedPreferences("jingdu", 0)).toRequestedOrientation()
         sharedUrlState.value = extractSharedUrl(intent)
-        setContent { JingduApp(initialUrl = sharedUrlState.value) }
+        debugCatalogActionState.value =
+            if (BuildConfig.DEBUG) intent?.getStringExtra(ExtraDebugCatalog).orEmpty() else ""
+        setContent {
+            JingduApp(
+                initialUrl = sharedUrlState.value,
+                debugCatalogAction = debugCatalogActionState.value
+            )
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         sharedUrlState.value = extractSharedUrl(intent)
+        if (BuildConfig.DEBUG) {
+            debugCatalogActionState.value = intent?.getStringExtra(ExtraDebugCatalog).orEmpty()
+        }
     }
 }
 
 @Composable
-private fun JingduApp(initialUrl: String = "") {
+private fun JingduApp(initialUrl: String = "", debugCatalogAction: String = "") {
     val context = androidx.compose.ui.platform.LocalContext.current
     val activity = context as? ComponentActivity
     val preferences = remember { context.getSharedPreferences("jingdu", 0) }
@@ -525,7 +541,7 @@ private fun JingduApp(initialUrl: String = "") {
         // or when the app is launched from a shared link.
         mutableStateOf(if (initialUrl.isNotBlank()) AppScreen.READER.name else AppScreen.HOME.name)
     }
-    var homeTab by rememberSaveable { mutableStateOf(HomeTab.HOME.name) }
+    var homeTab by rememberSaveable { mutableStateOf(HomeTab.SHELF.name) }
     var searchWebView by remember { mutableStateOf<WebView?>(null) }
     var searchWebViewGeneration by remember { mutableStateOf(0) }
     var searchLoadUrl by remember { mutableStateOf("") }
@@ -654,7 +670,12 @@ private fun JingduApp(initialUrl: String = "") {
             .filter { it.isNotEmpty() }
             .toSet()
     }
-    var catalogLoadUrl by remember {
+    // Always empty at launch: a saved progress page is a resume point, not a running crawl. The
+    // hidden WebView must not start fetching catalogue pages before the directory is opened.
+    var catalogLoadUrl by remember { mutableStateOf("") }
+    // The page a paused crawl will fetch next. Kept apart from catalogLoadUrl: that one drives the
+    // hidden WebView, so leaving it set would keep the crawl running while the reader is reading.
+    var catalogPendingUrl by remember {
         mutableStateOf(preferences.getString(CATALOG_STATE_LOAD_URL_KEY, "").orEmpty())
     }
     var catalogAggregateUrl by remember {
@@ -1084,7 +1105,7 @@ private fun JingduApp(initialUrl: String = "") {
         searchEngine = SearchEngine.BING
         searchResultRetries = 0
         searchWebViewGeneration += 1
-        searchLoadUrl = "https://cn.bing.com/search?q=$encoded&count=20"
+        searchLoadUrl = "https://cn.bing.com/search?q=$encoded&count=30&first=1"
         recordDiagnostic("search_start", searchLoadUrl, "query=$keyword site=$host engine=bing")
     }
 
@@ -1100,7 +1121,7 @@ private fun JingduApp(initialUrl: String = "") {
         searchLoading = true
         searchErrorMessage = null
         searchWebViewGeneration += 1
-        searchLoadUrl = "https://www.baidu.com/s?wd=" + java.net.URLEncoder.encode(term, "UTF-8") + "&rn=20"
+        searchLoadUrl = "https://www.baidu.com/s?wd=" + java.net.URLEncoder.encode(term, "UTF-8") + "&rn=30"
         recordDiagnostic("search_fallback", searchLoadUrl, "engine=baidu")
     }
 
@@ -1265,6 +1286,20 @@ private fun JingduApp(initialUrl: String = "") {
             .filter { it.isNotEmpty() }
             .firstOrNull { catalogPageKey(it) !in loaded && !sameUrl(it, catalog.sourceUrl) }
 
+    // The catalogue is only fetched while the reader is looking at it: crawling dozens of pages in
+    // the background competed with chapter prefetching and tripped the site's bot protection.
+    var catalogReloadDelayMillis by remember { mutableStateOf(0L) }
+    var catalogCrawling by remember { mutableStateOf(false) }
+    // How many pages the current directory session has already pulled; bounds the burst so a long
+    // catalogue never turns into dozens of rapid requests.
+    var catalogPagesFetched by remember { mutableStateOf(0) }
+
+    fun stopCatalogCrawl() {
+        catalogCrawling = false
+        catalogLoadUrl = ""
+        catalogWebView?.stopLoading()
+    }
+
     fun startCatalogCrawl(
         rawRootUrl: String,
         seed: ReaderDocument? = null,
@@ -1272,6 +1307,7 @@ private fun JingduApp(initialUrl: String = "") {
     ) {
         val rootUrl = normalizeUrl(rawRootUrl)
         if (rootUrl.isEmpty()) return
+        catalogCrawling = true
         val sameRoot = catalogAggregateUrl.isNotEmpty() && sameUrl(catalogAggregateUrl, rootUrl)
         if (forceReload) {
             invalidateCatalogCache(rootUrl)
@@ -1315,21 +1351,55 @@ private fun JingduApp(initialUrl: String = "") {
             catalogComplete = false
             catalogErrorMessage = null
             catalogLoadUrl = rootUrl
+            catalogPendingUrl = ""
             if (sameUrl(catalogWebView?.url.orEmpty(), rootUrl)) {
                 restartCatalogWebView()
             }
         }
     }
 
-    // Chapter pages can land here without a catalog, and some sites only reveal the next
-    // chapter through the catalog; warm it in the background so navigation stays available.
-    LaunchedEffect(document?.sourceUrl, document?.isCatalog, catalogAggregateUrl) {
-        val current = document?.takeUnless { it.isCatalog } ?: return@LaunchedEffect
-        val navigationCatalog = current.navigation.catalog ?: return@LaunchedEffect
-        val root = catalogAggregateUrl.takeIf { it.isNotEmpty() }
-            ?: navigationCatalog.href.let(::normalizeUrl)
-        if (root.isEmpty()) return@LaunchedEffect
-        startCatalogCrawl(root)
+    // Opening the directory starts a bounded batch; reaching the end of the list asks for more.
+    fun prepareCatalogForReading() {
+        val current = document?.takeUnless { it.isCatalog } ?: return
+        val root = activeCatalogUrl.takeIf { it.isNotEmpty() }
+            ?: current.navigation.catalog?.href?.let(::normalizeUrl).orEmpty()
+        if (root.isEmpty()) return
+        catalogCrawling = true
+        catalogPagesFetched = 0
+        if (!sameUrl(catalogAggregateUrl, root)) {
+            startCatalogCrawl(root)
+        } else if (catalogLoadUrl.isEmpty()) {
+            val resume = catalogPendingUrl.takeIf { it.isNotEmpty() }
+                ?: findCached(root)?.takeIf { it.isCatalog }?.let { nextCatalogPage(it, catalogLoadedUrls) }
+            if (resume != null) {
+                catalogLoadUrl = resume
+                catalogPendingUrl = resume
+                catalogReloadDelayMillis = 1_200L
+                catalogPagesFetched = 1
+            } else if (!catalogComplete) {
+                startCatalogCrawl(root)
+            }
+        }
+        recordDiagnostic("catalog_prepare", root, "pages=${catalogLoadedPageCount} complete=$catalogComplete")
+    }
+
+    // Called when the directory list reaches its end: allow another small batch.
+    fun requestMoreCatalogPages() {
+        if (catalogComplete || catalogLoadUrl.isNotEmpty() || loading || document?.isCatalog == true) return
+        val root = catalogAggregateUrl.ifEmpty { activeCatalogUrl }
+        if (root.isEmpty()) return
+        catalogCrawling = true
+        catalogPagesFetched = 1
+        catalogReloadDelayMillis = 1_200L
+        val target = catalogPendingUrl.takeIf { it.isNotEmpty() }
+            ?: findCached(root)?.takeIf { it.isCatalog }?.let { nextCatalogPage(it, catalogLoadedUrls) }
+        if (target != null) {
+            catalogLoadUrl = target
+            catalogPendingUrl = target
+        } else {
+            startCatalogCrawl(root)
+        }
+        recordDiagnostic("catalog_more", root, "pages=${catalogLoadedPageCount} next=${target.orEmpty()}")
     }
 
     fun updateShelfTitleFromCatalog(catalogUrl: String, catalog: ReaderDocument) {
@@ -1379,7 +1449,17 @@ private fun JingduApp(initialUrl: String = "") {
 
         val next = nextCatalogPage(merged, loadedAfter)
         catalogComplete = next == null
-        catalogLoadUrl = next.orEmpty()
+        catalogPendingUrl = next.orEmpty()
+        // Only keep pulling pages while the directory is actually being read, at a gentle pace so
+        // the site does not answer with a bot check. Otherwise the batch stops here and the next
+        // page is remembered until the reader asks for more.
+        if (next != null && catalogCrawling && catalogPagesFetched < CatalogPageBatchSize) {
+            catalogLoadUrl = next
+            catalogReloadDelayMillis = 1_200L
+            catalogPagesFetched += 1
+        } else {
+            catalogLoadUrl = ""
+        }
     }
 
     fun updateShelfForDocument(result: ReaderDocument) {
@@ -1427,9 +1507,6 @@ private fun JingduApp(initialUrl: String = "") {
         )
         shelfBooks = listOf(updated) + shelfBooks.filterNot { it.key == key }
         saveShelfBooks(preferences, shelfBooks)
-        if (catalog == null && catalogUrl.isNotBlank()) {
-            startCatalogCrawl(catalogUrl)
-        }
     }
 
     fun mergeCachedPageChain(startUrl: String): ReaderDocument? {
@@ -2164,7 +2241,7 @@ private fun JingduApp(initialUrl: String = "") {
         catalogLoadedUrls,
         catalogLoadedPageCount,
         catalogComplete,
-        catalogLoadUrl,
+        catalogPendingUrl,
         catalogErrorMessage
     ) {
         preferences.edit()
@@ -2172,7 +2249,8 @@ private fun JingduApp(initialUrl: String = "") {
             .putStringSet(CATALOG_STATE_LOADED_KEY, catalogLoadedUrls)
             .putInt(CATALOG_STATE_COUNT_KEY, catalogLoadedPageCount)
             .putBoolean(CATALOG_STATE_COMPLETE_KEY, catalogComplete)
-            .putString(CATALOG_STATE_LOAD_URL_KEY, catalogLoadUrl)
+            // The page still to fetch, so a relaunch resumes exactly where the crawl paused.
+            .putString(CATALOG_STATE_LOAD_URL_KEY, catalogPendingUrl)
             .putString(CATALOG_STATE_ERROR_KEY, catalogErrorMessage.orEmpty())
             .apply()
     }
@@ -2356,9 +2434,11 @@ private fun JingduApp(initialUrl: String = "") {
                     restartCatalogWebView()
                 }
                 webViewLoadTarget(view).isEmpty() -> {
-                    // Gentle throttling: a full catalog can span dozens of pages and pacing the
+                    // Gentle throttling: the directory can span dozens of pages and pacing the
                     // requests keeps anti-bot protection from challenging a long crawl.
-                    delay(300L)
+                    val wait = catalogReloadDelayMillis.coerceAtLeast(0L)
+                    catalogReloadDelayMillis = 0L
+                    if (wait > 0L) delay(wait)
                     if (catalogLoadUrl != target || catalogWebView !== view) return@LaunchedEffect
                     view.stopLoading()
                     val referer = catalogWebView?.url.orEmpty().takeIf { it.isNotBlank() && !sameUrl(it, target) }
@@ -2525,30 +2605,16 @@ private fun JingduApp(initialUrl: String = "") {
                                         searchErrorMessage = null
                                         accepted = true
                                     } else if (payload != null) {
-                                        // Search pages render their result list asynchronously, so an
-                                        // empty parse is retried before falling back to another engine.
+                                        // Bing answers with a near-empty redirect page first; an empty
+                                        // parse must not stop the later attempts from finding results.
                                         if (searchResults.isEmpty() && searchResultRetries < 2) {
                                             searchResultRetries += 1
-                                            view.postDelayed({
-                                                if (requestToken != webViewLoadToken(view)) return@postDelayed
-                                                view.evaluateJavascript(ReaderScript.searchResults) { retried ->
-                                                    val retryPayload = parseSearchResults(retried)
-                                                    if (retryPayload != null && retryPayload.isNotEmpty()) {
-                                                        searchResults = retryPayload
-                                                        searchLoading = false
-                                                        searchErrorMessage = null
-                                                    }
-                                                }
-                                            }, 2_500L)
-                                        } else if (searchResults.isEmpty() &&
-                                            searchEngine == SearchEngine.BING
-                                        ) {
+                                        } else if (searchResults.isEmpty() && searchEngine == SearchEngine.BING) {
                                             fallbackSearchToBaidu()
                                         } else if (searchResults.isEmpty()) {
                                             searchLoading = false
-                                            searchErrorMessage = "没有找到书籍页，换个书名或换个限定站点试试"
+                                            searchErrorMessage = "没有找到结果，换个书名或换个限定站点试试"
                                         }
-                                        accepted = true
                                     }
                                 }
                                 accepted
@@ -2567,7 +2633,7 @@ private fun JingduApp(initialUrl: String = "") {
 
             if (screen == AppScreen.HOME.name) {
                 HomeScaffold(
-                    palette = IvoryPalette,
+                    palette = paletteFor(settings.theme),
                     activeTab = homeTab,
                     onTabChange = { homeTab = it },
                     address = address,
@@ -2692,6 +2758,7 @@ private fun JingduApp(initialUrl: String = "") {
                     catalogIndex = activeCatalogIndex,
                     catalogLoading = catalogLoadUrl.isNotEmpty(),
                     catalogLoadedPageCount = catalogLoadedPageCount,
+                    debugCatalogAction = debugCatalogAction,
                     catalogComplete = catalogComplete,
                     catalogError = catalogErrorMessage,
                     isInBookshelf = currentBookInShelf,
@@ -2753,15 +2820,13 @@ private fun JingduApp(initialUrl: String = "") {
                     onNavigateFromCatalog = { href, catalogUrl, index ->
                         openUrl(href, catalogUrlOverride = catalogUrl, catalogIndexOverride = index)
                     },
-                    onOpenCatalog = {
-                        val catalogUrl = activeCatalogUrl.takeIf { it.isNotEmpty() } ?: baseCatalogUrl
-                        if (catalogUrl.isNotEmpty()) startCatalogCrawl(catalogUrl)
-
-                    },
+                    onOpenCatalog = { prepareCatalogForReading() },
+                    onCloseCatalog = { stopCatalogCrawl() },
                     onRetryCatalog = {
                         val catalogUrl = activeCatalogUrl.takeIf { it.isNotEmpty() } ?: baseCatalogUrl
                         if (catalogUrl.isNotEmpty()) startCatalogCrawl(catalogUrl, forceReload = true)
                     },
+                    onRequestMoreCatalogPages = { requestMoreCatalogPages() },
                     onClose = {
                         (visibleDocumentForPersistence ?: document)?.let { current ->
                             saveCachedReaderDocument(preferences, current, commit = true)
@@ -2784,6 +2849,19 @@ private fun JingduApp(initialUrl: String = "") {
                          }
                      }
                 )
+                // Debug-only probe used by tools/device-catalog-check.ps1: it drives the directory
+                // flow that otherwise needs taps. It never runs in a release build.
+                LaunchedEffect(debugCatalogAction, document?.sourceUrl) {
+                    if (!BuildConfig.DEBUG || debugCatalogAction.isEmpty()) return@LaunchedEffect
+                    val current = document?.takeUnless { it.isCatalog } ?: return@LaunchedEffect
+                    if (current.paragraphs.isEmpty()) return@LaunchedEffect
+                    prepareCatalogForReading()
+                    if (debugCatalogAction == "crawl") {
+                        // Wait for the first page, then act like a reader who reached the end.
+                        delay(4_000L)
+                        requestMoreCatalogPages()
+                    }
+                }
             }
             availableUpdate?.let { update ->
                 AlertDialog(
@@ -3047,7 +3125,11 @@ private fun createReaderWebView(
                     if (requestToken != webViewLoadToken(view)) return@postDelayed
                     if (acceptedPayloadToken == requestToken) return@postDelayed
                     val currentUrl = view.url.orEmpty()
-                    if (currentUrl.isNotEmpty() && !sameReaderLoadUrl(currentUrl, url)) {
+                    // Search engines redirect to their real result page, so a different URL still
+                    // needs extraction; reader pages keep the strict same-URL guard.
+                    if (extractScript === ReaderScript.extract &&
+                        currentUrl.isNotEmpty() && !sameReaderLoadUrl(currentUrl, url)
+                    ) {
                         onTrace(label, "extract_skip token=$requestToken loaded=$currentUrl")
                         return@postDelayed
                     }
@@ -3208,15 +3290,6 @@ private fun HomeScaffold(
     Column(modifier = Modifier.fillMaxSize().background(palette.background)) {
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             when (activeTab) {
-                HomeTab.SHELF.name -> ShelfTab(
-                    palette = palette,
-                    books = books,
-                    onOpenBook = onOpenBook,
-                    onRemoveBook = onRemoveBook,
-                    onCopyBookUrl = onCopyBookUrl,
-                    onShareBookUrl = onShareBookUrl,
-                    onRenameBook = onRenameBook
-                )
                 HomeTab.SEARCH.name -> SearchTab(
                     palette = palette,
                     query = searchQuery,
@@ -3235,23 +3308,23 @@ private fun HomeScaffold(
                     palette = palette,
                     settings = settings,
                     onSettingsChange = onSettingsChange,
-                    onCheckForUpdate = onCheckForUpdate,
-                    updateChecking = updateChecking,
-                    updateStatusMessage = updateStatusMessage
-                )
-                else -> MainHomeTab(
-                    palette = palette,
                     address = address,
                     onAddressChange = onAddressChange,
                     onOpenAddress = onOpenAddress,
                     recentUrl = recentUrl,
                     onOpenRecent = onOpenRecent,
-                    shelfCount = books.size,
-                    onOpenShelf = { onTabChange(HomeTab.SHELF.name) },
-                    onOpenSearch = { onTabChange(HomeTab.SEARCH.name) },
                     onCheckForUpdate = onCheckForUpdate,
                     updateChecking = updateChecking,
                     updateStatusMessage = updateStatusMessage
+                )
+                else -> ShelfTab(
+                    palette = palette,
+                    books = books,
+                    onOpenBook = onOpenBook,
+                    onRemoveBook = onRemoveBook,
+                    onCopyBookUrl = onCopyBookUrl,
+                    onShareBookUrl = onShareBookUrl,
+                    onRenameBook = onRenameBook
                 )
             }
         }
@@ -3375,7 +3448,6 @@ private fun BottomTabBar(
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            TabBarItem(Icons.Default.Home, "首页", activeTab == HomeTab.HOME.name, palette) { onTabChange(HomeTab.HOME.name) }
             TabBarItem(Icons.Default.Bookmark, "书架", activeTab == HomeTab.SHELF.name, palette) { onTabChange(HomeTab.SHELF.name) }
             TabBarItem(Icons.Default.Search, "搜索", activeTab == HomeTab.SEARCH.name, palette) { onTabChange(HomeTab.SEARCH.name) }
             TabBarItem(Icons.Default.Settings, "设置", activeTab == HomeTab.SETTINGS.name, palette) { onTabChange(HomeTab.SETTINGS.name) }
@@ -3456,7 +3528,7 @@ private fun ShelfTab(
                     Spacer(Modifier.height(12.dp))
                     Text("书架为空", color = palette.ink, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(6.dp))
-                    Text("从首页或搜索页加入书籍", color = palette.muted, fontSize = 12.sp)
+                    Text("从搜索页找到书籍后加入书架", color = palette.muted, fontSize = 12.sp)
                 }
             }
         } else {
@@ -3684,12 +3756,30 @@ private fun SettingsTab(
     palette: ReaderPalette,
     settings: ReaderSettings,
     onSettingsChange: (ReaderSettings) -> Unit,
+    address: String,
+    onAddressChange: (String) -> Unit,
+    onOpenAddress: () -> Unit,
+    recentUrl: String?,
+    onOpenRecent: (String) -> Unit,
     onCheckForUpdate: () -> Unit,
     updateChecking: Boolean,
     updateStatusMessage: String?
 ) {
     Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)) {
         Text("设置", color = palette.ink, fontSize = 22.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 12.dp, bottom = 6.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("夜间模式", color = palette.ink, fontSize = 14.sp, modifier = Modifier.weight(1f))
+            SettingChip("开", settings.theme == ReaderTheme.NIGHT, palette) {
+                onSettingsChange(settings.copy(theme = ReaderTheme.NIGHT))
+            }
+            SettingChip("关", settings.theme != ReaderTheme.NIGHT, palette) {
+                onSettingsChange(settings.copy(theme = ReaderTheme.IVORY))
+            }
+        }
         ReaderSettingsPanel(
             palette = palette,
             settings = settings,
@@ -3697,6 +3787,35 @@ private fun SettingsTab(
             onClose = {},
             modifier = Modifier.fillMaxWidth()
         )
+        Spacer(Modifier.height(16.dp))
+        Text("打开小说网页", color = palette.ink, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = address,
+            onValueChange = onAddressChange,
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            placeholder = { Text("https://example.com/novel") },
+            shape = RoundedCornerShape(9.dp)
+        )
+        Spacer(Modifier.height(10.dp))
+        Button(
+            onClick = onOpenAddress,
+            modifier = Modifier.fillMaxWidth().height(46.dp),
+            shape = RoundedCornerShape(9.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = palette.accent)
+        ) {
+            Icon(Icons.Default.ArrowForward, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text("打开并整理", fontSize = 14.sp)
+        }
+        if (!recentUrl.isNullOrBlank()) {
+            Spacer(Modifier.height(12.dp))
+            Text("上次打开", fontSize = 11.sp, color = palette.muted)
+            TextButton(onClick = { onOpenRecent(recentUrl) }, contentPadding = PaddingValues(0.dp)) {
+                Text(recentUrl, maxLines = 2, overflow = TextOverflow.Ellipsis, color = palette.accent)
+            }
+        }
         Spacer(Modifier.height(14.dp))
         OutlinedButton(
             onClick = onCheckForUpdate,
@@ -3898,7 +4017,10 @@ private fun ReaderScreen(
     onContinueToChapter: (String, Int, Int) -> Unit,
     onNavigateFromCatalog: (String, String, Int) -> Unit,
     onOpenCatalog: () -> Unit,
+    onCloseCatalog: () -> Unit,
     onRetryCatalog: () -> Unit,
+    onRequestMoreCatalogPages: () -> Unit,
+    debugCatalogAction: String = "",
     onClose: () -> Unit,
     onReload: () -> Unit,
     onAutoNext: () -> Unit,
@@ -4002,8 +4124,7 @@ private fun ReaderScreen(
                         menuVisible = false
                         catalogOpenGeneration += 1
                         panel = ReaderPanel.CATALOG.name
-                    },
-                    isInBookshelf = isInBookshelf,
+                    },                    isInBookshelf = isInBookshelf,
                     onAddToBookshelf = {
                         onAddToBookshelf()
                         menuVisible = false
@@ -4042,9 +4163,13 @@ private fun ReaderScreen(
                         onNavigateFromCatalog(href, catalogDocument?.sourceUrl.orEmpty(), index)
                     },
                 onRetryCatalog = onRetryCatalog,
-                    onClose = { panel = ReaderPanel.NONE.name },
+                    onClose = {
+                        panel = ReaderPanel.NONE.name
+                        onCloseCatalog()
+                    },
                     openGeneration = catalogOpenGeneration,
                     onJumpDiagnostic = onJumpDiagnostic,
+                    onReachCatalogEnd = onRequestMoreCatalogPages,
                     modifier = Modifier.align(Alignment.CenterStart)
                 )
             }
@@ -4285,7 +4410,7 @@ private fun ReaderSettingsPanel(
 }
 
 @Composable
-private fun CatalogDrawer(
+internal fun CatalogDrawer(
     currentDocument: ReaderDocument?,
     catalogDocument: ReaderDocument?,
     loading: Boolean,
@@ -4302,6 +4427,7 @@ private fun CatalogDrawer(
     onClose: () -> Unit,
     openGeneration: Int = 0,
     onJumpDiagnostic: (String) -> Unit = {},
+    onReachCatalogEnd: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val currentUrl = currentDocument?.sourceUrl.orEmpty()
@@ -4324,25 +4450,43 @@ private fun CatalogDrawer(
     val listState = rememberLazyListState()
     var positionedKey by remember(catalogDocument?.sourceUrl) { mutableStateOf("") }
     var pendingPosition by remember(catalogDocument?.sourceUrl) { mutableStateOf<Int?>(null) }
-    // Re-centering is keyed on the open generation too, so every time the directory slides in it
-    // lands on the chapter being read instead of keeping the previous scroll position.
-    LaunchedEffect(
-        catalogDocument?.sourceUrl,
-        catalogItemCount,
-        catalogLastItemKey,
-        currentUrl,
-        currentTitle,
-        currentIndex,
-        openGeneration
-    ) {
-        if (currentIndex >= 0) {
-            val targetKey = "${catalogDocument?.sourceUrl}:$currentIndex"
-            if (positionedKey != targetKey || openGeneration > 0) {
-                // Header entry occupies index 0 in the list.
-                listState.scrollToItem(currentIndex + 1)
-                pendingPosition = currentIndex + 1
-                positionedKey = targetKey
-            }
+    // The camera only follows the reading position when the drawer is (re)opened: catalog pages
+    // appended while it is already open must never scroll the list back to the current chapter.
+    val openKey = "${catalogDocument?.sourceUrl}:$openGeneration"
+    var positionedOpenKey by remember(catalogDocument?.sourceUrl) { mutableStateOf("") }
+    // The row of the chapter being read inside the list (header entry occupies index 0), or -1.
+    val currentChapterRow = if (currentIndex >= 0) currentIndex + 1 else -1
+    LaunchedEffect(catalogDocument?.sourceUrl, catalogItemCount, catalogLastItemKey, openGeneration) {
+        if (currentChapterRow < 0) return@LaunchedEffect
+        if (positionedOpenKey != openKey) {
+            listState.scrollToItem(currentChapterRow)
+            pendingPosition = currentChapterRow
+            positionedKey = "${catalogDocument?.sourceUrl}:$currentIndex"
+            positionedOpenKey = openKey
+        }
+    }
+    LaunchedEffect(currentUrl, currentTitle) {
+        // A chapter change with the drawer open still moves the highlight, but only when the list
+        // itself has no position yet for it.
+        if (currentChapterRow < 0) return@LaunchedEffect
+        if (positionedKey != "${catalogDocument?.sourceUrl}:$currentIndex") {
+            listState.scrollToItem(currentChapterRow)
+            pendingPosition = currentChapterRow
+            positionedKey = "${catalogDocument?.sourceUrl}:$currentIndex"
+            positionedOpenKey = openKey
+        }
+    }
+    // Fetch the next batch once the reader has actually scrolled down to the end of the loaded
+    // entries. Requiring a scrolled state keeps the first layout (which has nothing loaded yet)
+    // from asking for pages the reader has not even looked at.
+    LaunchedEffect(listState, catalogItemCount, complete) {
+        snapshotFlow {
+            val info = listState.layoutInfo
+            val first = info.visibleItemsInfo.firstOrNull()?.index ?: 0
+            val last = info.visibleItemsInfo.lastOrNull()?.index ?: 0
+            first > 0 && last >= info.totalItemsCount - 3
+        }.collect { atEnd ->
+            if (atEnd && catalogItemCount > 0 && !complete) onReachCatalogEnd()
         }
     }
     // Center the current chapter once its row is actually laid out; the first scroll often runs
@@ -4475,7 +4619,9 @@ private fun CatalogDrawer(
                                 Text(catalogDocument.title, color = palette.accent, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                                 Text("${catalogDocument.catalogItems.size} 个章节", color = palette.muted, fontSize = 10.sp)
                                 when {
-                                    loading -> Text("正在自动加载全部目录（已加载 ${loadedPageCount} 页）", color = palette.muted, fontSize = 10.sp)
+                                    loading -> Text("正在加载后续目录（已加载 ${loadedPageCount} 页）", color = palette.muted, fontSize = 10.sp)
+                                    !complete && catalogDocument.catalogItems.isNotEmpty() ->
+                                        Text("继续下拉到底部可加载更多（已加载 ${loadedPageCount} 页）", color = palette.muted, fontSize = 10.sp)
                                     errorMessage != null -> Column {
                                         Text(errorMessage, color = palette.muted, fontSize = 10.sp)
                                         TextButton(
@@ -5923,7 +6069,7 @@ private fun JingduTheme(theme: ReaderTheme, content: @Composable () -> Unit) {
     )
 }
 
-private fun paletteFor(theme: ReaderTheme): ReaderPalette = when (theme) {
+internal fun paletteFor(theme: ReaderTheme): ReaderPalette = when (theme) {
     ReaderTheme.IVORY -> IvoryPalette
     ReaderTheme.PAPER -> PaperPalette
     ReaderTheme.NIGHT -> NightPalette
