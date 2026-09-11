@@ -2854,11 +2854,28 @@ private fun JingduApp(initialUrl: String = "") {
                     confirmButton = {
                         TextButton(
                             onClick = {
-                                val url = update.downloadUrl ?: update.releaseUrl
-                                runCatching {
-                                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-                                }
+                                val candidates = (update.downloadMirrors + listOfNotNull(update.downloadUrl))
+                                    .filter { it.isNotBlank() }
                                 availableUpdate = null
+                                if (candidates.isEmpty()) {
+                                    runCatching {
+                                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(update.releaseUrl)))
+                                    }
+                                    return@TextButton
+                                }
+                                updateScope.launch {
+                                    // GitHub's own asset host is blocked on some networks, so probe
+                                    // before handing the browser a link that only opens an error page.
+                                    val url = firstReachableDownloadUrl(candidates) ?: update.releaseUrl
+                                    if (candidates.firstOrNull() != url) {
+                                        updateStatusMessage = "直连 GitHub 打不开，已改用镜像下载"
+                                    }
+                                    runCatching {
+                                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                                    }.onFailure {
+                                        updateStatusMessage = "没有可用的下载链接，请到发布页手动下载"
+                                    }
+                                }
                             }
                         ) {
                             Text(if (update.downloadUrl != null) "下载更新" else "查看详情")
