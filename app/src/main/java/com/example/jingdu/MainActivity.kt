@@ -706,8 +706,27 @@ private fun JingduApp(initialUrl: String = "") {
     fun cacheDocument(result: ReaderDocument, requestedUrl: String = "") {
         val aliases = listOf(cacheKey(result.sourceUrl), cacheKey(requestedUrl)).filter { it.isNotEmpty() }.distinct()
         if (aliases.isEmpty()) return
+        // Never downgrade a chapter that is already cached together with its later text pages: a
+        // single-page parse arriving late must not replace the whole chapter with its first half.
+        val previous = aliases.firstNotNullOfOrNull { cachedDocuments[it] }
+        val stored = if (
+            previous != null && !previous.isCatalog && !result.isCatalog &&
+            previous.paragraphs.size > result.paragraphs.size
+        ) {
+            result.copy(
+                paragraphs = previous.paragraphs,
+                title = previous.title,
+                navigation = result.navigation.copy(
+                    previousPage = previous.navigation.previousPage ?: result.navigation.previousPage,
+                    nextPage = previous.navigation.nextPage ?: result.navigation.nextPage,
+                    next = previous.navigation.next ?: result.navigation.next
+                )
+            )
+        } else {
+            result
+        }
         val updated = cachedDocuments.toMutableMap()
-        aliases.forEach { updated[it] = result }
+        aliases.forEach { updated[it] = stored }
         cachedDocuments = updated
     }
 
@@ -1274,7 +1293,7 @@ private fun JingduApp(initialUrl: String = "") {
             current = mergePagedDocuments(current, continuation)
             current = mergeCachedContinuation(current)
         }
-        cacheDocument(current, startUrl)
+        if (current.paragraphs.size > base.paragraphs.size) cacheDocument(current, startUrl)
         return current
     }
 
@@ -1466,14 +1485,17 @@ private fun JingduApp(initialUrl: String = "") {
             chapterOpenPosition = null
             verticalOpenIndex = null
             verticalOpenOffset = null
-            readingOffset = savedReadingOffset(cached.sourceUrl) ?: readingOffset
-            currentUrl = cached.sourceUrl
-            address = cached.sourceUrl
+            // Re-attach any cached later pages so a previously half-loaded chapter reads whole.
+            val complete = mergeCachedPageChain(cached.sourceUrl) ?: cached
+            if (complete.paragraphs.size > cached.paragraphs.size) windowRevision += 1
+            readingOffset = savedReadingOffset(complete.sourceUrl) ?: readingOffset
+            currentUrl = complete.sourceUrl
+            address = complete.sourceUrl
             loading = false
             errorMessage = null
-            saveCachedReaderDocument(preferences, cached)
-            preparePrevious(cached)
-            prepareNext(cached)
+            saveCachedReaderDocument(preferences, complete)
+            preparePrevious(complete)
+            prepareNext(complete)
             return
         }
         if (cached != null) {
