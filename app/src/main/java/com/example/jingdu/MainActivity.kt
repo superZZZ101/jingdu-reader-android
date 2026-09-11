@@ -144,10 +144,61 @@ private const val CATALOG_STATE_COMPLETE_KEY = "catalog_state_complete"
 private const val CATALOG_STATE_LOAD_URL_KEY = "catalog_state_load_url"
 private const val CATALOG_STATE_ERROR_KEY = "catalog_state_error"
 private const val DIAGNOSTIC_LOG_KEY = "diagnostic_log"
-private const val MAX_DIAGNOSTIC_LOGS = 80
+private const val MAX_DIAGNOSTIC_LOGS = 150
 
 private fun ReaderDocument.isUsableForReading(): Boolean =
     (isCatalog && catalogItems.isNotEmpty()) || (!isCatalog && paragraphs.isNotEmpty())
+
+private data class ReaderNavigationLinks(
+    val previous: ReaderLink? = null,
+    val next: ReaderLink? = null,
+    val catalog: ReaderLink? = null
+)
+
+// Some sites hide the next chapter behind the book catalog (the chapter page itself only links
+// to its own continuation pages), so neighbour links resolve from the loaded catalog first.
+private fun adjacentChapterFromCatalog(
+    document: ReaderDocument,
+    catalog: ReaderDocument?,
+    step: Int
+): ReaderLink? {
+    val items = catalog?.catalogItems.orEmpty()
+    if (items.isEmpty() || document.isCatalog) return null
+    val keys = listOf(document.sourceUrl).filter { it.isNotBlank() } +
+        listOfNotNull(document.navigation.catalog?.href)
+    val index = items.indexOfFirst { item -> keys.any { sameUrl(item.href, it) } }
+    if (index < 0) return null
+    return items.getOrNull(index + step)
+}
+
+private fun resolveReaderNavigationLinks(
+    document: ReaderDocument,
+    catalog: ReaderDocument?,
+    nextChapter: ReaderDocument? = null
+): ReaderNavigationLinks {
+    if (document.isCatalog) {
+        return ReaderNavigationLinks(previous = null, next = null, catalog = document.navigation.catalog)
+    }
+    val catalogNext = adjacentChapterFromCatalog(document, catalog, 1)
+        ?.takeUnless { sameUrl(it.href, document.sourceUrl) }
+    val continuation = document.navigation.nextPage?.href?.let(::normalizeUrl).orEmpty()
+    val navigationNext = document.navigation.next?.takeUnless { sameUrl(it.href, document.sourceUrl) }
+    val displayNext = nextChapter
+        ?.takeUnless { sameUrl(it.sourceUrl, document.sourceUrl) }
+        ?.let { ReaderLink(it.title, it.sourceUrl) }
+    val next = catalogNext
+        ?: displayNext
+        ?: navigationNext?.takeIf { continuation.isEmpty() || !sameUrl(it.href, continuation) }
+        ?: catalogNext
+    val previous = adjacentChapterFromCatalog(document, catalog, -1)
+        ?.takeUnless { sameUrl(it.href, document.sourceUrl) }
+        ?: document.navigation.previous
+    return ReaderNavigationLinks(
+        previous = previous,
+        next = next,
+        catalog = document.navigation.catalog
+    )
+}
 
 private fun mergePagedDocuments(base: ReaderDocument, continuation: ReaderDocument): ReaderDocument {
     val baseNavigation = base.navigation
@@ -549,6 +600,7 @@ private fun JingduApp(initialUrl: String = "") {
         )
     }
     var activeCatalogIndex by remember { mutableStateOf<Int?>(null) }
+    var catalogNavigationRevision by remember { mutableStateOf(0) }
     var chapterOpenPosition by remember { mutableStateOf<ChapterOpenPosition?>(null) }
     var verticalOpenIndex by remember { mutableStateOf<Int?>(null) }
     var verticalOpenOffset by remember { mutableStateOf<Int?>(null) }
@@ -836,6 +888,21 @@ private fun JingduApp(initialUrl: String = "") {
         }
     }
 
+    fun navigationCatalogFor(result: ReaderDocument): ReaderDocument? {
+        val catalogUrl = activeCatalogUrl.takeIf { it.isNotEmpty() }
+            ?: result.navigation.catalog?.href?.let(::normalizeUrl).orEmpty()
+        if (catalogUrl.isEmpty()) return null
+        return findCached(catalogUrl)?.takeIf { it.isCatalog }
+    }
+
+    // Chapter pages often expose only a "next page" link, with the real next chapter living on
+    // the continuation page or in the catalog; fall back in that order so the reader can advance.
+    fun nextChapterLink(result: ReaderDocument): ReaderLink? =
+        resolveReaderNavigationLinks(result, navigationCatalogFor(result)).next
+
+    fun previousChapterLink(result: ReaderDocument): ReaderLink? =
+        resolveReaderNavigationLinks(result, navigationCatalogFor(result)).previous
+
     fun prepareNext(result: ReaderDocument) {
         if (result.isCatalog) {
             setPrefetchTarget("", "")
@@ -846,7 +913,7 @@ private fun JingduApp(initialUrl: String = "") {
             setPrefetchTarget(cacheKey(result.sourceUrl), currentContinuation)
             return
         }
-        val next = result.navigation.next?.href?.let(::normalizeUrl).orEmpty()
+        val next = nextChapterLink(result)?.href?.let(::normalizeUrl).orEmpty()
         val cachedNext = next.takeIf { it.isNotEmpty() }?.let(::findCached)
         val nextContinuation = cachedNext?.let(::uncachedPageContinuationUrl)
         if (nextContinuation != null && !sameUrl(nextContinuation, cachedNext.sourceUrl)) {
@@ -866,7 +933,7 @@ private fun JingduApp(initialUrl: String = "") {
             previousLoadUrl = ""
             return
         }
-        val previous = result.navigation.previous?.href?.let(::normalizeUrl).orEmpty()
+        val previous = previousChapterLink(result)?.href?.let(::normalizeUrl).orEmpty()
         val cachedPrevious = previous.takeIf { it.isNotEmpty() }?.let(::findCached)
         val previousContinuation = cachedPrevious?.let(::uncachedPageContinuationUrl)
         if (cachedPrevious != null && previousContinuation != null && !sameUrl(previousContinuation, cachedPrevious.sourceUrl)) {
@@ -878,7 +945,7 @@ private fun JingduApp(initialUrl: String = "") {
         previousLoadUrl = if (previous.isNotEmpty() && !previousReady && !sameUrl(previous, result.sourceUrl)) previous else ""
     }
 
-    LaunchedEffect(document?.sourceUrl, document?.isCatalog) {
+    LaunchedEffect(document?.sourceUrl, document?.isCatalog, catalogNavigationRevision) {
         document?.takeUnless { it.isCatalog }?.let { restored ->
             preparePrevious(restored)
             prepareNext(restored)
@@ -950,6 +1017,17 @@ private fun JingduApp(initialUrl: String = "") {
         }
     }
 
+    // Chapter pages can land here without a catalog, and some sites only reveal the next
+    // chapter through the catalog; warm it in the background so navigation stays available.
+    LaunchedEffect(document?.sourceUrl, document?.isCatalog, catalogAggregateUrl) {
+        val current = document?.takeUnless { it.isCatalog } ?: return@LaunchedEffect
+        val navigationCatalog = current.navigation.catalog ?: return@LaunchedEffect
+        val root = catalogAggregateUrl.takeIf { it.isNotEmpty() }
+            ?: navigationCatalog.href.let(::normalizeUrl)
+        if (root.isEmpty()) return@LaunchedEffect
+        startCatalogCrawl(root)
+    }
+
     fun updateShelfTitleFromCatalog(catalogUrl: String, catalog: ReaderDocument) {
         if (!catalog.isCatalog) return
         val current = document?.takeUnless { it.isCatalog } ?: return
@@ -981,6 +1059,7 @@ private fun JingduApp(initialUrl: String = "") {
         catalogLoadedUrls = loadedAfter
         catalogLoadedPageCount += loadedAfter.size - loadedBefore.size
         catalogErrorMessage = null
+        catalogNavigationRevision += 1
         updateShelfTitleFromCatalog(rootUrl, merged)
 
         if (document?.isCatalog == true && (
@@ -1258,7 +1337,7 @@ private fun JingduApp(initialUrl: String = "") {
             prepareNext(current)
             return
         }
-        val nextUrl = current.navigation.next?.href?.let(::normalizeUrl).orEmpty()
+        val nextUrl = current.let(::nextChapterLink)?.href?.let(::normalizeUrl).orEmpty()
         if (nextUrl.isEmpty() || sameUrl(nextUrl, current.sourceUrl)) {
             pendingAutoNext = hasUncachedPageContinuation(current)
             return
@@ -1294,11 +1373,20 @@ private fun JingduApp(initialUrl: String = "") {
             return
         }
         val current = document
-        val nextUrl = current?.navigation?.next?.href?.let(::normalizeUrl).orEmpty()
+        val nextUrl = current?.let(::nextChapterLink)?.href?.let(::normalizeUrl).orEmpty()
         pendingAutoNext = false
         if (current != null && nextUrl.isNotEmpty() && sameUrl(nextUrl, target)) {
             recordDiagnostic("auto_next_prefetch_fallback", target, reason)
-            openChapter(target, ChapterOpenPosition.START)
+            // The prefetched page may only be the first text page of the next chapter; prefer the
+            // cached continuation so the user never lands in the middle of a chapter.
+            val cachedNext = findCached(nextUrl)
+                ?.takeUnless { it.isCatalog || it.paragraphs.isEmpty() }
+                ?.let(::mergeCachedContinuation)
+            if (cachedNext != null) {
+                showDocument(cachedNext, nextUrl, ChapterOpenPosition.START)
+            } else {
+                openChapter(target, ChapterOpenPosition.START)
+            }
         } else {
             loading = false
             errorMessage = "下一章暂时无法预读取，请点击重试"
@@ -1338,6 +1426,10 @@ private fun JingduApp(initialUrl: String = "") {
                     visibleDocumentForPersistence = merged
                     currentUrl = merged.sourceUrl
                     address = merged.sourceUrl
+                    val catalogUrl = merged.navigation.catalog?.href?.let(::normalizeUrl).orEmpty()
+                    if (catalogUrl.isNotEmpty() && !sameUrl(catalogUrl, activeCatalogUrl)) {
+                        activeCatalogUrl = catalogUrl
+                    }
                     saveCachedReaderDocument(preferences, merged)
                     updateShelfForDocument(merged)
                     pruneCache(merged, previousDocument)
@@ -1673,6 +1765,7 @@ private fun JingduApp(initialUrl: String = "") {
         document?.paragraphs?.size,
         document?.navigation?.next?.href,
         document?.navigation?.nextPage?.href,
+        catalogNavigationRevision,
         prefetchLoadUrl,
         cachedDocuments
     ) {
@@ -1685,7 +1778,7 @@ private fun JingduApp(initialUrl: String = "") {
             return@LaunchedEffect
         }
         if (hasUncachedPageContinuation(current)) return@LaunchedEffect
-        val nextUrl = current.navigation.next?.href?.let(::normalizeUrl).orEmpty()
+        val nextUrl = nextChapterLink(current)?.href?.let(::normalizeUrl).orEmpty()
         if (nextUrl.isEmpty() || sameUrl(nextUrl, current.sourceUrl)) {
             pendingAutoNext = false
             return@LaunchedEffect
@@ -1834,6 +1927,10 @@ private fun JingduApp(initialUrl: String = "") {
                     restartCatalogWebView()
                 }
                 webViewLoadTarget(view).isEmpty() -> {
+                    // Gentle throttling: a full catalog can span dozens of pages and pacing the
+                    // requests keeps anti-bot protection from challenging a long crawl.
+                    delay(300L)
+                    if (catalogLoadUrl != target || catalogWebView !== view) return@LaunchedEffect
                     view.stopLoading()
                     val referer = catalogWebView?.url.orEmpty().takeIf { it.isNotBlank() && !sameUrl(it, target) }
                         ?: currentUrl.takeIf { it.isNotBlank() && !sameUrl(it, target) }.orEmpty()
@@ -1872,6 +1969,8 @@ private fun JingduApp(initialUrl: String = "") {
                     factory = { viewContext ->
                         createReaderWebView(
                             context = viewContext,
+                            label = "active",
+                            onTrace = { name, details -> recordDiagnostic("web_$name", "", details) },
                             onPayload = { view, requestToken, pageUrl, rawPayload -> activePayloadState.value(view, requestToken, pageUrl, rawPayload) },
                             onError = { view, requestToken, pageUrl, reason -> activeErrorState.value(view, requestToken, pageUrl, reason) }
                         ).also { activeWebView = it }
@@ -1892,6 +1991,8 @@ private fun JingduApp(initialUrl: String = "") {
                     factory = { viewContext ->
                         createReaderWebView(
                             context = viewContext,
+                            label = "prefetch",
+                            onTrace = { name, details -> recordDiagnostic("web_$name", "", details) },
                             onPayload = { view, requestToken, pageUrl, rawPayload -> prefetchPayloadState.value(view, requestToken, pageUrl, rawPayload) },
                             onError = { view, requestToken, pageUrl, reason -> prefetchErrorState.value(view, requestToken, pageUrl, reason) }
                         ).also { prefetchWebView = it }
@@ -1912,6 +2013,8 @@ private fun JingduApp(initialUrl: String = "") {
                     factory = { viewContext ->
                         createReaderWebView(
                             context = viewContext,
+                            label = "previous",
+                            onTrace = { name, details -> recordDiagnostic("web_$name", "", details) },
                             onPayload = { view, requestToken, pageUrl, rawPayload -> previousPayloadState.value(view, requestToken, pageUrl, rawPayload) },
                             onError = { view, requestToken, pageUrl, reason -> previousErrorState.value(view, requestToken, pageUrl, reason) }
                         ).also { previousWebView = it }
@@ -1932,6 +2035,8 @@ private fun JingduApp(initialUrl: String = "") {
                     factory = { viewContext ->
                         createReaderWebView(
                             context = viewContext,
+                            label = "catalog",
+                            onTrace = { name, details -> recordDiagnostic("web_$name", "", details) },
                             onPayload = { view, requestToken, pageUrl, rawPayload -> catalogPayloadState.value(view, requestToken, pageUrl, rawPayload) },
                             onError = { view, requestToken, pageUrl, reason -> catalogErrorState.value(view, requestToken, pageUrl, reason) }
                         ).also { catalogWebView = it }
@@ -1972,8 +2077,11 @@ private fun JingduApp(initialUrl: String = "") {
             } else {
                 val baseCatalogUrl = document?.navigation?.catalog?.href?.let(::normalizeUrl).orEmpty()
                 val cachedCatalog = activeCatalogUrl.takeIf { it.isNotEmpty() }?.let(::findCached)
+                val navigationLinks = document?.let { current ->
+                    resolveReaderNavigationLinks(current, cachedCatalog)
+                } ?: ReaderNavigationLinks(catalog = document?.navigation?.catalog)
                 val currentSourceUrl = document?.sourceUrl.orEmpty()
-                val previousChapter = document?.navigation?.previous?.href
+                val previousChapter = navigationLinks.previous?.href
                     ?.let(::normalizeUrl)
                     ?.let(::findCached)
                     ?.let(::mergeCachedContinuation)
@@ -1983,7 +2091,7 @@ private fun JingduApp(initialUrl: String = "") {
                             !hasUncachedPageContinuation(cached)
                     }
                     ?.takeUnless { cached -> sameUrl(cached.sourceUrl, currentSourceUrl) }
-                val nextChapter = document?.navigation?.next?.href
+                val nextChapter = navigationLinks.next?.href
                     ?.let(::normalizeUrl)
                     ?.let(::findCached)
                     ?.let(::mergeCachedContinuation)
@@ -2021,6 +2129,7 @@ private fun JingduApp(initialUrl: String = "") {
                     previousChapter = previousChapter,
                     nextChapter = nextChapter,
                     nextChapterReady = nextChapterReady,
+                    navigationLinks = navigationLinks,
                     catalogDocument = cachedCatalog,
                     catalogIndex = activeCatalogIndex,
                     catalogLoading = catalogLoadUrl.isNotEmpty(),
@@ -2107,11 +2216,13 @@ private fun JingduApp(initialUrl: String = "") {
                     onReload = { openUrl(currentUrl, forceReload = true) },
                      onAutoNext = { requestAutoNext() },
                      onOpenNextChapter = {
-                         val next = document?.navigation?.next
-                         if (next != null && !sameUrl(next.href, document?.sourceUrl.orEmpty())) {
-                             openChapter(next.href, ChapterOpenPosition.START)
-                         } else {
-                             requestAutoNext()
+                         document?.let { current ->
+                             val next = nextChapterLink(current)
+                             if (next != null && !sameUrl(next.href, current.sourceUrl)) {
+                                 openChapter(next.href, ChapterOpenPosition.START)
+                             } else {
+                                 requestAutoNext()
+                             }
                          }
                      }
                 )
@@ -2246,6 +2357,8 @@ private fun startWebViewLoad(view: WebView, target: String, referer: String = ""
 @SuppressLint("SetJavaScriptEnabled")
 private fun createReaderWebView(
     context: android.content.Context,
+    label: String,
+    onTrace: (String, String) -> Unit,
     onPayload: (WebView, Long, String, String) -> Boolean,
     onError: (WebView, Long, String, String) -> Unit
 ): WebView {
@@ -2257,6 +2370,46 @@ private fun createReaderWebView(
         var cloudflareChallengeToken = 0L
         var acceptedPayloadToken = 0L
         var reportedErrorToken = 0L
+        var blockedRedirects = 0
+
+        fun requestHost(raw: String): String =
+            runCatching { Uri.parse(raw).host?.lowercase().orEmpty() }.getOrDefault("")
+
+        fun registrableTail(host: String): String = host.trimEnd('.').split('.').takeLast(2).joinToString(".")
+
+        fun sameSite(left: String, right: String): Boolean {
+            val leftHost = requestHost(left)
+            val rightHost = requestHost(right)
+            if (leftHost.isEmpty() || rightHost.isEmpty()) return false
+            if (leftHost == rightHost) return true
+            return registrableTail(leftHost) == registrableTail(rightHost)
+        }
+
+        // Chapter sites routinely attach pop-under scripts that redirect the hidden reader
+        // WebView to ad pages; keep every reader WebView on the site it was asked to read.
+        fun offTarget(rawUrl: String): Boolean {
+            val target = webViewLoadTarget(this)
+            if (target.isEmpty() || rawUrl.isEmpty()) return false
+            val targetScheme = runCatching { Uri.parse(target).scheme?.lowercase().orEmpty() }.getOrDefault("")
+            val scheme = runCatching { Uri.parse(rawUrl).scheme?.lowercase().orEmpty() }.getOrDefault("")
+            if (scheme != "http" && scheme != "https") return true
+            if (targetScheme != "http" && targetScheme != "https") return false
+            return !sameSite(target, rawUrl)
+        }
+
+        fun guardNavigation(view: WebView, rawUrl: String): Boolean {
+            if (!offTarget(rawUrl)) return false
+            blockedRedirects += 1
+            view.stopLoading()
+            // Throttle: ad scripts can retry hundreds of times per page.
+            if (blockedRedirects == 1 || blockedRedirects % 20 == 0) {
+                onTrace(
+                    label,
+                    "blocked_offsite token=${webViewLoadToken(view)} count=$blockedRedirects target=${webViewLoadTarget(view)} attempted=$rawUrl"
+                )
+            }
+            return true
+        }
 
         fun reportError(view: WebView, requestToken: Long, url: String, reason: String) {
             if (requestToken == 0L || reportedErrorToken == requestToken) return
@@ -2285,6 +2438,7 @@ private fun createReaderWebView(
             }
             nativeFallbackCount += 1
             nativeFallbackInFlightToken = requestToken
+            onTrace(label, "native_fallback token=$requestToken attempt=$nativeFallbackCount url=$url reason=$reason")
             val referer = webViewLoadReferer(view)
             val cookie = runCatching {
                 android.webkit.CookieManager.getInstance().getCookie(url).orEmpty()
@@ -2330,12 +2484,17 @@ private fun createReaderWebView(
                     if (requestToken != webViewLoadToken(view)) return@postDelayed
                     if (acceptedPayloadToken == requestToken) return@postDelayed
                     val currentUrl = view.url.orEmpty()
-                    if (currentUrl.isNotEmpty() && !sameReaderLoadUrl(currentUrl, url)) return@postDelayed
+                    if (currentUrl.isNotEmpty() && !sameReaderLoadUrl(currentUrl, url)) {
+                        onTrace(label, "extract_skip token=$requestToken loaded=$currentUrl")
+                        return@postDelayed
+                    }
                     view.evaluateJavascript(ReaderScript.extract) { rawPayload ->
                         if (onPayload(view, requestToken, url, rawPayload)) {
                             acceptedPayloadToken = requestToken
                             if (nativeFallbackInFlightToken == requestToken) nativeFallbackInFlightToken = 0L
+                            onTrace(label, "accepted token=$requestToken delay=$delayMillis url=$url length=${rawPayload?.length ?: 0}")
                         } else if (finalAttempt && requestToken == webViewLoadToken(view)) {
+                            onTrace(label, "rejected token=$requestToken delay=$delayMillis url=$url loaded=${view.url.orEmpty()} length=${rawPayload?.length ?: 0}")
                             view.evaluateJavascript(ReaderScript.challengeProbe) { challengePayload ->
                                 if (requestToken == webViewLoadToken(view) &&
                                     rawPayloadLooksLikeCloudflareChallenge(challengePayload)
@@ -2353,7 +2512,9 @@ private fun createReaderWebView(
             }
 
             override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
+                if (guardNavigation(view, url)) return
                 val requestToken = webViewLoadToken(view)
+                onTrace(label, "page_started token=$requestToken url=$url")
                 if (cloudflareChallengeToken == requestToken &&
                     !url.contains("__cf_chl_", ignoreCase = true)
                 ) {
@@ -2380,15 +2541,34 @@ private fun createReaderWebView(
             }
 
             override fun onPageFinished(view: WebView, url: String) {
+                if (guardNavigation(view, url)) return
                 val requestToken = webViewLoadToken(view)
+                onTrace(label, "page_finished token=$requestToken url=$url")
                 scheduleExtraction(view, url, requestToken, 0L)
                 scheduleExtraction(view, url, requestToken, 700L)
                 scheduleExtraction(view, url, requestToken, 2_000L)
                 scheduleExtraction(view, url, requestToken, 5_000L, finalAttempt = true)
             }
 
+            override fun shouldOverrideUrlLoading(
+                view: WebView,
+                request: android.webkit.WebResourceRequest
+            ): Boolean {
+                if (!request.isForMainFrame) return false
+                return guardNavigation(view, request.url.toString())
+            }
+
+            @Suppress("DEPRECATION")
+            override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean =
+                guardNavigation(view, url)
+
             override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
                 if (request.isForMainFrame) {
+                    guardNavigation(view, request.url.toString())
+                    onTrace(
+                        label,
+                        "main_frame_error token=${webViewLoadToken(view)} url=${request.url} code=${error.errorCode} description=${error.description}"
+                    )
                     tryNativeFallback(
                         view,
                         request.url.toString(),
@@ -2406,6 +2586,8 @@ private fun createReaderWebView(
                 if (request.isForMainFrame) {
                     val requestUrl = request.url.toString()
                     val requestToken = webViewLoadToken(view)
+                    guardNavigation(view, requestUrl)
+                    onTrace(label, "main_frame_http_error token=$requestToken status=${errorResponse.statusCode} url=$requestUrl")
                     if (isCloudflareChallengeResponse(errorResponse)) {
                         reportCloudflareChallenge(
                             view,
@@ -2630,6 +2812,7 @@ private fun ReaderScreen(
     previousChapter: ReaderDocument?,
     nextChapter: ReaderDocument?,
     nextChapterReady: Boolean,
+    navigationLinks: ReaderNavigationLinks,
     catalogDocument: ReaderDocument?,
     catalogIndex: Int?,
     catalogLoading: Boolean,
@@ -2708,6 +2891,7 @@ private fun ReaderScreen(
                     previousChapter = previousChapter,
                     nextChapter = nextChapter,
                     nextChapterReady = nextChapterReady,
+                    navigationLinks = navigationLinks,
                     verticalOpenIndex = verticalOpenIndex,
                     verticalOpenOffset = verticalOpenOffset,
                     onPositionChange = onPositionChange,
@@ -2730,12 +2914,13 @@ private fun ReaderScreen(
                     palette = palette,
                     onPreviousChapter = {
                         menuVisible = false
-                        document?.navigation?.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.START) }
+                        navigationLinks.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.START) }
                     },
                     onNextChapter = {
                         menuVisible = false
                         onOpenNextChapter()
                     },
+                    nextChapterAvailable = navigationLinks.next != null,
                     onOpenCatalog = {
                         onOpenCatalog()
                         menuVisible = false
@@ -2795,6 +2980,7 @@ private fun ReaderMenu(
     onPreviousChapter: () -> Unit,
     onOpenCatalog: () -> Unit,
     onNextChapter: () -> Unit,
+    nextChapterAvailable: Boolean,
     onAddToBookshelf: () -> Unit,
     onOpenSettings: () -> Unit,
     onExitReading: () -> Unit,
@@ -2832,7 +3018,7 @@ private fun ReaderMenu(
             MenuAction(
                 icon = Icons.Default.ArrowForward,
                 label = "下一章",
-                enabled = document?.navigation?.next != null,
+                enabled = nextChapterAvailable,
                 palette = palette,
                 onClick = onNextChapter
             )
@@ -3426,6 +3612,7 @@ private fun ChapterView(
     previousChapter: ReaderDocument?,
     nextChapter: ReaderDocument?,
     nextChapterReady: Boolean,
+    navigationLinks: ReaderNavigationLinks,
     onPositionChange: (ReadingPositionSnapshot, Boolean) -> Unit,
     onContinueToChapter: (String, Int, Int) -> Unit,
     onNavigateChapter: (String, ChapterOpenPosition) -> Unit,
@@ -3456,6 +3643,7 @@ private fun ChapterView(
             previousChapter = previousChapter,
             nextChapter = nextChapter,
             nextChapterReady = nextChapterReady,
+            navigationLinks = navigationLinks,
             onPositionChange = onPositionChange,
             onContinueToChapter = onContinueToChapter,
             onNavigateChapter = onNavigateChapter,
@@ -3476,6 +3664,7 @@ private fun VerticalChapterView(
     previousChapter: ReaderDocument?,
     nextChapter: ReaderDocument?,
     nextChapterReady: Boolean,
+    navigationLinks: ReaderNavigationLinks,
     onPositionChange: (ReadingPositionSnapshot, Boolean) -> Unit,
     onContinueToChapter: (String, Int, Int) -> Unit,
     onNavigateChapter: (String, ChapterOpenPosition) -> Unit,
@@ -3692,7 +3881,7 @@ private fun VerticalChapterView(
                     return@collectLatest
                 }
                 if (!viewport.canScrollBackward && previousChapter != null) {
-                    document.navigation.previous?.let {
+                    navigationLinks.previous?.let {
                         onContinueToChapter(it.href, 0, 0)
                     }
                 }
@@ -3715,7 +3904,7 @@ private fun VerticalChapterView(
                 canScrollForward = { listState.canScrollForward },
                 onUserScroll = { userScrollGeneration += 1 },
                 onSwipeBackward = {
-                    if (previousChapter == null) document.navigation.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.END) }
+                    if (previousChapter == null) navigationLinks.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.END) }
                 },
                 onSwipeForward = { if (nextChapter == null || !nextChapterReady) onAutoNext() }
             ),

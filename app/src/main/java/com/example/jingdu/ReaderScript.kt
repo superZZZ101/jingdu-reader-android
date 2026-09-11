@@ -11,10 +11,10 @@ object ReaderScript {
     val extract = """
         (() => {
           const NOISE = 'script,style,noscript,template,iframe,canvas,svg,nav,aside,header,footer,form,button,input,textarea,select,option,[role="navigation"],[role="complementary"],[aria-hidden="true"],[hidden],.topbar,.header,.nav,.m-nav,.m-setting,.footer,.section-opt,.hotcmd-wp,.hotcmd-box,.ad,.ads,.advert,.advertisement,.adsbygoogle,.ad-container,[class*="ad-"],[class*="-ad"],[id*="ad-"],[id*="-ad"],.popup,.modal,.overlay,.recommend,.recommendation,.related,.share,.social,.comment,.comments,.toolbar,.pagination,.chapter-nav,.breadcrumb,.notice,.copyright';
-          const CATALOG_CONTAINERS = '#list,#catalog,#chapter-list,#chapterList,#目录,.catalog,.catalog-list,.chapter-list,.chapterList,.chapter-list-box,.book-list,.book-chapter-list,.listmain,.volume-list,.directory,[class*="chapter-list"],[id*="chapter-list"]';
-          const PAGE_CONTAINERS = '.pagination,.pager,.pages,.page,.page-list,.pageList,[class*="pagination"],[class*="pager"],[class*="page-list"],[id*="pagination"],[id*="pager"],[id*="page-list"]';
-          const CATALOG_WORD = /(目录|章节目录|目录页|书目|catalog|contents?)/i;
-          const CATALOG_CONTAINER_WORD = /(catalog|chapter[-_]?list|directory|listmain|目录|章节)/i;
+          const CATALOG_CONTAINERS = '#list,#catalog,#chapter-list,#chapterList,#目录,.catalog,.catalog-list,.chapter-list,.chapterList,.chapter-list-box,.book-list,.book-chapter-list,.listmain,.volume-list,.directory,.section-box,.section-list,[class*="chapter-list"],[class*="chapter_list"],[class*="chapterlist"],[id*="chapter-list"],[id*="chapterlist"],[class*="volume"],[id*="volume"]';
+          const PAGE_CONTAINERS = '.pagination,.pager,.pages,.page,.page-list,.pageList,.listpage,[class*="pagination"],[class*="pager"],[class*="page-list"],[class*="listpage"],[id*="pagination"],[id*="pager"],[id*="page-list"]';
+          const CATALOG_WORD = /(目录|章节目录|目录页|书目|章节列表|最新章节|全部章节|catalog|contents?)/i;
+          const CATALOG_CONTAINER_WORD = /(catalog|chapter[-_]?list|directory|listmain|section-list|section-box|目录|章节)/i;
           const CHAPTER_WORD = /(第.{1,24}[章回节卷集篇]|序章|楔子|番外|终章|尾声|chapter\s*[0-9一二三四五六七八九十]+)/i;
           const PAGE_WORD = /^(上一页|下一页|上页|下页|前页|后页|第一页|最后一页|第?\s*\d+\s*页|page\s*\d+|\d+\s*[-~～—]\s*\d+\s*(?:章|回|节)?)$/i;
           const BLOCKS = new Set(['ADDRESS','ARTICLE','BLOCKQUOTE','DIV','DL','DT','DD','FIGCAPTION','FIGURE','H1','H2','H3','H4','H5','H6','HEADER','HR','LI','MAIN','OL','P','PRE','SECTION','TABLE','TR','UL']);
@@ -39,6 +39,26 @@ object ReaderScript {
               depth += 1;
             }
             return false;
+          }
+          function visibilityHidden(element) {
+            if (element.hidden || element.getAttribute('aria-hidden') === 'true') return true;
+            try {
+              const computed = getComputedStyle(element);
+              return computed.visibility === 'hidden' || computed.opacity === '0';
+            } catch (_) { return false; }
+          }
+          function collectAnchors() {
+            const anchors = [];
+            for (const anchor of document.querySelectorAll('a[href]')) {
+              if (anchor.closest('#rm-root')) continue;
+              if (anchor.closest(NOISE)) continue;
+              if (visibilityHidden(anchor)) continue;
+              anchors.push(anchor);
+            }
+            return anchors;
+          }
+          function tagIdHint(element) {
+            return ((element.id || '') + ' ' + (typeof element.className === 'string' ? element.className : '')).trim();
           }
           function urlFor(anchor) {
             try {
@@ -75,6 +95,13 @@ object ReaderScript {
             const pageLooksLikeChapter = CHAPTER_WORD.test(document.title) ||
               [...document.querySelectorAll('h1,h2,h3,.chapter-title,.chapterTitle,.title')]
                 .some((heading) => CHAPTER_WORD.test(clean(heading.textContent)));
+            const chapterAnchorCount = (container) =>
+              [...container.querySelectorAll('a[href]')].filter((anchor) => {
+                const label = labelFor(anchor);
+                return label.length >= 2 && label.length <= 140 && !PAGE_WORD.test(label) && CHAPTER_WORD.test(label);
+              }).length;
+            const scopeAnchorCount = (container) =>
+              [...container.querySelectorAll('a[href]')].filter((anchor) => labelFor(anchor).length >= 2).length;
             let best = [];
             let bestScore = -1;
             for (const container of containers) {
@@ -88,18 +115,55 @@ object ReaderScript {
                 return PAGE_WORD.test(label) || pageNumber(label);
               });
               if (container === document.body && items.length < 4 && !hasPaginationHint && pageLooksLikeChapter) continue;
+              // A chapter page can contain a sidebar such as "related novels"; a real chapter list
+              // holds many chapter-styled links, so a link-heavy but chapter-poor block is not a catalog.
+              if (container !== document.body && pageLooksLikeChapter && chapterAnchorCount(container) < 4) continue;
               if (!marked && !bodyLooksLikeCatalog && !hasPaginationHint) continue;
-              const score = items.length * 12 + (marked ? 240 : 0) + (container !== document.body ? 120 : 0);
+              let score = items.length * 12 + (marked ? 240 : 0) + (container !== document.body ? 120 : 0);
+              // "Latest chapters" teasers look like a catalog but only repeat a few chapters; prefer
+              // the sibling or parent block that actually carries the full list.
+              const parent = container.parentElement;
+              const neighbours = parent ? [parent, ...parent.children] : [];
+              for (const other of neighbours) {
+                if (other === container || other.tagName !== 'DIV' && other.tagName !== 'UL' && other.tagName !== 'SECTION' && other.tagName !== 'MAIN') continue;
+                const otherIds = (other.id || '') + ' ' + (typeof other.className === 'string' ? other.className : '');
+                if (!CATALOG_CONTAINER_WORD.test(otherIds)) continue;
+                if (scopeAnchorCount(other) >= Math.max(8, items.length * 2)) score -= 400;
+              }
               if (score > bestScore) { bestScore = score; best = items; }
             }
             return best;
           }
 
+          function samePageFamily(href) {
+            try {
+              const left = location.pathname.replace(/[^/]*$/, '');
+              const right = new URL(href, location.href).pathname.replace(/[^/]*$/, '');
+              return left === right;
+            } catch (_) { return false; }
+          }
+          function findCatalogPageOptions() {
+            const pages = [];
+            const seen = new Set();
+            document.querySelectorAll('select').forEach((select) => {
+              const container = select.closest(PAGE_CONTAINERS);
+              const hint = ((select.name || '') + ' ' + (select.id || '') + ' ' + (select.className || '')).toLowerCase();
+              if (!container && !/page|pageno|pagenum|pagelist|select/.test(hint)) return;
+              select.querySelectorAll('option').forEach((option) => {
+                const raw = (option.value || option.getAttribute('data-href') || option.getAttribute('data-url') || '').trim();
+                if (!raw || /^(#|javascript:)/i.test(raw)) return;
+                const href = urlFor({ getAttribute: () => raw, href: raw });
+                if (!href || !samePageFamily(href) || seen.has(href)) return;
+                seen.add(href);
+                pages.push({ label: clean(option.textContent) || raw, href });
+              });
+            });
+            return pages;
+          }
           function findCatalogPages() {
             const pages = [];
             const seen = new Set();
-            for (const anchor of document.querySelectorAll('a[href]')) {
-              if (anchor.closest('#rm-root') || hiddenTree(anchor)) continue;
+            for (const anchor of collectAnchors()) {
               const href = urlFor(anchor);
               const label = labelFor(anchor);
               const inPageContainer = Boolean(anchor.closest(PAGE_CONTAINERS));
@@ -108,12 +172,17 @@ object ReaderScript {
               seen.add(href);
               pages.push({ label, href });
             }
+            findCatalogPageOptions().forEach((page) => {
+              if (seen.has(page.href)) return;
+              seen.add(page.href);
+              pages.push(page);
+            });
             return pages;
           }
 
           function findCandidate() {
-            const selectors = ['article','main','[role="main"]','.reader-main','.read-main','#chaptercontent','#chapter-content','#content','.chapter-content','.chapterContent','.read-content','.readContent','.reading-content','.novel-content','.article-content','.content','.txtnav','.book-text','.book-content','.text-content'];
-            const preferred = ['#content','#chaptercontent','#chapter-content','.chapter-content','.chapterContent','.read-content','.readContent','.reading-content','.novel-content','.article-content','.content','.txtnav','.book-text','.book-content','.text-content'];
+            const selectors = ['article','main','[role="main"]','.reader-main','.read-main','#chaptercontent','#chapter-content','#content','.chapter-content','.chapterContent','.read-content','.readContent','.reading-content','.novel-content','.article-content','.content','.con','.txtnav','.book-text','.book-content','.text-content'];
+            const preferred = ['#content','#chaptercontent','#chapter-content','.chapter-content','.chapterContent','.read-content','.readContent','.reading-content','.novel-content','.article-content','.content','.con','.txtnav','.book-text','.book-content','.text-content'];
             for (const selector of preferred) {
               const element = document.querySelector(selector);
               if (element && visible(element).replace(/\\s/g, '').length >= 80) return element;
@@ -164,12 +233,19 @@ object ReaderScript {
             return result;
           }
           function headingFor(candidate) {
-            const localHeading = candidate.querySelector('h1,h2,h3,.chapter-title,.chapterTitle,.title');
-            if (localHeading) return clean(localHeading.textContent);
-            const pageHeading = [...document.querySelectorAll('h1,h2,h3,.chapter-title,.chapterTitle,.title')]
+            const selectors = ['h1','h2','.chapter-title','.chapterTitle','.title','h3'];
+            for (const selector of selectors) {
+              const local = candidate.querySelector(selector);
+              if (!local) continue;
+              const text = clean(local.textContent);
+              if (text && CHAPTER_WORD.test(text)) return text;
+            }
+            const local = candidate.querySelector(selectors.join(','));
+            const localText = local ? clean(local.textContent) : '';
+            if (localText) return localText;
+            return [...document.querySelectorAll('h1,h2,h3,.chapter-title,.chapterTitle,.title')]
               .map((item) => clean(item.textContent))
-              .find((item) => CHAPTER_WORD.test(item));
-            return pageHeading || '';
+              .find((item) => CHAPTER_WORD.test(item)) || '';
           }
           function titleForCatalog() {
             const headings = [...document.querySelectorAll('h1,h2,h3')].map((item) => clean(item.textContent)).filter((item) => item.length >= 2 && item.length <= 120);
@@ -179,7 +255,10 @@ object ReaderScript {
           }
           function sameLink(anchor, patterns) {
             const text = labelFor(anchor);
-            const descriptor = text + ' ' + anchor.id + ' ' + anchor.className + ' ' + (anchor.getAttribute('aria-label') || '');
+            const parent = anchor.parentElement;
+            const ancestorHint = parent ? ((parent.id || '') + ' ' + (typeof parent.className === 'string' ? parent.className : '')) : '';
+            const descriptor = text + ' ' + anchor.id + ' ' + anchor.className + ' ' +
+              (anchor.getAttribute('aria-label') || '') + ' ' + ancestorHint;
             const rel = (anchor.rel || '').toLowerCase();
             return patterns.rel.test(rel) || patterns.text.test(text) || patterns.hint.test(descriptor);
           }
@@ -191,10 +270,10 @@ object ReaderScript {
               next: { rel: /(^|\s)(next|continue)(\s|$)/i, text: /^(下一章|下章|下一节|后一章|后一回|next|continue)$/i, hint: /下一章|下一节|后一章|后一回/i },
               previousPage: { rel: /(^|\s)(page[-_ ]?prev|prev[-_ ]?page)(\s|$)/i, text: /^(上一页|上页|前页|prev(?:ious)?\s*page)$/i, hint: /上一页|上页|前页/i },
               nextPage: { rel: /(^|\s)(page[-_ ]?next|next[-_ ]?page)(\s|$)/i, text: /^(下一页|下页|后页|next\s*page)$/i, hint: /下一页|下页|后页/i },
-              catalog: { rel: /(^|\s)(contents?|catalog)(\s|$)/i, text: /^(目录|章节目录|返回目录|书目|目录页|catalog|contents?)$/i, hint: /目录|书目|catalog|contents?/i }
+              catalog: { rel: /(^|\s)(contents?|catalog)(\s|$)/i, text: /^(目录|章节目录|返回目录|返回书页|回到书页|书目|目录页|章节列表|全部章节|查看目录|本书目录|book\s*list|catalog|contents?)$/i, hint: /目录|书目|章节列表|全部章节|book[-_]?list|catalog|contents?/i }
             };
-            for (const anchor of document.querySelectorAll('a[href]')) {
-              if (anchor.closest('#rm-root') || hidden(anchor)) continue;
+            const anchors = collectAnchors();
+            for (const anchor of anchors) {
               const href = urlFor(anchor);
               if (!href) continue;
               const label = labelFor(anchor);
@@ -220,6 +299,28 @@ object ReaderScript {
                 if (value > score[kind]) { score[kind] = value; result[kind] = { label, href }; }
               }
             }
+            if (result.catalog == null) {
+              // Sites often expose the book page through a breadcrumb to the work itself, e.g.
+              // "<site> > <book title>" pointing at the catalog root from a chapter page.
+              const folder = location.pathname.split('/').filter(Boolean).slice(0, -1).join('/');
+              if (folder) {
+                const candidate = anchors
+                  .map((anchor) => ({ label: labelFor(anchor), href: urlFor(anchor), element: anchor }))
+                  .filter((item) => {
+                    if (!item.href) return false;
+                    if (item.label.length < 2 || item.label.length > 80) return false;
+                    if (PAGE_WORD.test(item.label) || CHAPTER_WORD.test(item.label)) return false;
+                    if (item.element.closest('ul,ol,select,.nav,.topbar,.header,.footer,.m-nav,.hotcmd-wp,.cmd-bd,.menu,.listpage')) return false;
+                    const target = new URL(item.href);
+                    if (target.origin !== location.origin || target.search || !target.pathname.endsWith('/')) return false;
+                    const segments = target.pathname.split('/').filter(Boolean);
+                    if (segments.length !== 1 || segments[0] !== folder) return false;
+                    return item.href !== location.href;
+                  })
+                  .sort((left, right) => left.href.length - right.href.length);
+                if (candidate.length) result.catalog = { label: candidate[0].label, href: candidate[0].href };
+              }
+            }
             return result;
           }
 
@@ -229,10 +330,12 @@ object ReaderScript {
           }
           const candidate = findCandidate();
           const catalogItems = findCatalogItems();
-          const catalogPages = catalogItems.length ? findCatalogPages() : [];
           const heading = headingFor(candidate);
           const headingLooksChapter = heading !== '' && CHAPTER_WORD.test(heading);
           const isCatalog = catalogItems.length > 0 && !headingLooksChapter;
+          // Paginated catalogs (numbered pages, "next page" links, page <select>) feed the catalog
+          // crawler; chapter-page text continuations stay in navigation.nextPage instead.
+          const catalogPages = findCatalogPages();
           const title = isCatalog ? titleForCatalog() : (heading || clean(document.title) || '未识别标题');
           const clone = candidate.cloneNode(true);
           const originalNodes = [candidate, ...candidate.querySelectorAll('*')];

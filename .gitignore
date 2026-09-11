@@ -8,4 +8,5 @@ build/
 keystore.properties
 *.jks
 *.keystore
+.device-check/
 .DS_Store

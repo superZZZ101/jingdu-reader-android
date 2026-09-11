@@ -164,6 +164,15 @@ fun cleanChapterTitle(raw: String): String {
     var title = raw.trim()
         .replace(Regex("\\s*[（(]\\s*\\d+\\s*/\\s*\\d+\\s*[）)]\\s*$"), "")
         .trim()
+    // Breadcrumb headings such as "<book title> > <chapter>" keep the chapter only when the
+    // trailing segment still looks like a chapter.
+    val separator = title.indexOf(" > ")
+    if (separator > 0) {
+        val tail = title.substring(separator + 3).trim()
+        if (tail.isNotEmpty() && Regex("(第.{1,24}[章节回卷集篇]|序章|楔子|番外|终章|尾声)").containsMatchIn(tail)) {
+            title = tail
+        }
+    }
     val underscore = title.indexOf('_')
     if (underscore > 0) {
         val suffix = title.substring(underscore + 1)
