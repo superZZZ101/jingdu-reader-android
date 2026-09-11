@@ -1208,6 +1208,46 @@ private fun JingduApp(initialUrl: String = "") {
         }
     }
 
+    fun mergeCachedPageChain(startUrl: String): ReaderDocument? {
+        val base = startUrl.takeIf { it.isNotEmpty() }?.let(::findCached) ?: return null
+        if (base.isCatalog || base.paragraphs.isEmpty()) return null
+        val merged = mergeCachedContinuation(base)
+        if (!sameUrl(merged.sourceUrl, base.sourceUrl)) return merged
+        // Absorb the current chapter's own text continuation pages when they are already cached.
+        var current = merged
+        val seen = mutableSetOf(cacheKey(current.sourceUrl))
+        while (true) {
+            val continuationUrl = current.navigation.nextPage?.href?.let(::normalizeUrl).orEmpty()
+            val continuationKey = cacheKey(continuationUrl)
+            if (continuationKey.isEmpty() || !seen.add(continuationKey)) break
+            val continuation = findCached(continuationUrl) ?: break
+            if (continuation.isCatalog || continuation.paragraphs.isEmpty()) break
+            if (sameUrl(continuation.sourceUrl, current.sourceUrl)) break
+            current = mergePagedDocuments(current, continuation)
+            current = mergeCachedContinuation(current)
+        }
+        cacheDocument(current, startUrl)
+        return current
+    }
+
+    fun prewarmReadingWindow(current: ReaderDocument) {
+        if (current.isCatalog) return
+        val links = resolveReaderNavigationLinks(current, navigationCatalogFor(current))
+        var materialized = 0
+        listOfNotNull(links.previous, links.next).forEach { link ->
+            val url = normalizeUrl(link.href)
+            if (url.isEmpty() || sameUrl(url, current.sourceUrl)) return@forEach
+            if (mergeCachedPageChain(url) != null) materialized += 1
+        }
+        if (materialized > 0) {
+            recordDiagnostic(
+                "prewarm_window",
+                current.sourceUrl,
+                "previous=${links.previous?.href.orEmpty()} next=${links.next?.href.orEmpty()} cached=$materialized"
+            )
+        }
+    }
+
     fun showDocument(
         result: ReaderDocument,
         requestedUrl: String,
@@ -1257,6 +1297,9 @@ private fun JingduApp(initialUrl: String = "") {
         pruneCache(displayResult, previousDocument)
         restartPrefetchWebView()
         prefetchChapterDepth = 0
+        // Assemble the reading window from what is already cached, so the chapters beside the
+        // current one are ready to render before any background download finishes.
+        prewarmReadingWindow(displayResult)
         preparePrevious(displayResult)
         prepareNext(displayResult)
         if (displayResult.isCatalog) startCatalogCrawl(displayResult.sourceUrl, displayResult)
