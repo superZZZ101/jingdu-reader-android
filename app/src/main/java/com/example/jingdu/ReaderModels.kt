@@ -241,7 +241,9 @@ data class ShelfBook(
     val catalogUrl: String,
     val lastReadUrl: String,
     val lastChapterTitle: String,
-    val updatedAt: Long
+    val updatedAt: Long,
+    // A name the reader typed themselves; automatic title refresh must not overwrite it.
+    val customTitle: Boolean = false
 )
 
 private const val SHELF_BOOKS_KEY = "shelf_books"
@@ -354,14 +356,22 @@ fun loadShelfBooks(preferences: SharedPreferences): List<ShelfBook> {
                 val key = item.optString("key").trim()
                 val lastReadUrl = item.optString("lastReadUrl").trim()
                 if (key.isEmpty() || lastReadUrl.isEmpty()) continue
+                val customTitle = item.optBoolean("customTitle", false)
+                val storedTitle = item.optString("title", "未命名书籍")
                 add(
                     ShelfBook(
                         key = key,
-                        title = cleanChapterTitle(item.optString("title", "未命名书籍")).ifEmpty { "未命名书籍" },
+                        // A name the reader typed is used verbatim instead of being cleaned up.
+                        title = if (customTitle) {
+                            storedTitle.ifBlank { "未命名书籍" }
+                        } else {
+                            cleanChapterTitle(storedTitle).ifEmpty { "未命名书籍" }
+                        },
                         catalogUrl = item.optString("catalogUrl").trim(),
                         lastReadUrl = lastReadUrl,
                         lastChapterTitle = cleanChapterTitle(item.optString("lastChapterTitle")),
-                        updatedAt = item.optLong("updatedAt", 0L)
+                        updatedAt = item.optLong("updatedAt", 0L),
+                        customTitle = customTitle
                     )
                 )
             }
@@ -380,6 +390,7 @@ fun saveShelfBooks(preferences: SharedPreferences, books: List<ShelfBook>) {
                 put("lastReadUrl", book.lastReadUrl)
                 put("lastChapterTitle", book.lastChapterTitle)
                 put("updatedAt", book.updatedAt)
+                put("customTitle", book.customTitle)
             }
         )
     }

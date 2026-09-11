@@ -59,6 +59,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
@@ -381,6 +382,9 @@ private fun buildDiagnosticReport(
     currentUrl: String,
     activeLoadUrl: String,
     prefetchLoadUrl: String,
+    prefetchPageBaseUrl: String,
+    prefetchDepth: Int,
+    loadedChapterCount: Int,
     previousLoadUrl: String,
     catalogLoadUrl: String,
     pendingUrl: String?,
@@ -396,6 +400,9 @@ private fun buildDiagnosticReport(
     appendLine("currentUrl=${diagnosticValue(currentUrl)}")
     appendLine("activeLoadUrl=${diagnosticValue(activeLoadUrl)}")
     appendLine("prefetchLoadUrl=${diagnosticValue(prefetchLoadUrl)}")
+    appendLine("prefetchPageBaseUrl=${diagnosticValue(prefetchPageBaseUrl)}")
+    appendLine("prefetchDepth=$prefetchDepth")
+    appendLine("loadedChapters=$loadedChapterCount")
     appendLine("previousLoadUrl=${diagnosticValue(previousLoadUrl)}")
     appendLine("catalogLoadUrl=${diagnosticValue(catalogLoadUrl)}")
     appendLine("pendingUrl=${diagnosticValue(pendingUrl.orEmpty())}")
@@ -730,6 +737,24 @@ private fun JingduApp(initialUrl: String = "") {
         cachedDocuments = updated
     }
 
+    // Opening a chapter from the directory must update the persisted progress right away; position
+    // callbacks only fire once the reader moves in horizontal mode. Vertical continuation offsets
+    // are intentionally left alone here: they are what keeps the reader's place across a promotion.
+    fun rememberActiveDocumentForPersistence(target: ReaderDocument, requestedUrl: String) {
+        if (target.isCatalog) return
+        visibleDocumentForPersistence = target
+        preferences.edit().putString("last_url", target.sourceUrl).apply()
+        saveCachedReaderDocument(preferences, target)
+        val catalogUrl = target.navigation.catalog?.href?.let(::normalizeUrl).orEmpty()
+        if (catalogUrl.isNotEmpty() && !sameUrl(catalogUrl, activeCatalogUrl)) activeCatalogUrl = catalogUrl
+        if (catalogUrl.isNotEmpty()) {
+            val index = cachedDocuments[cacheKey(catalogUrl)]?.catalogItems?.indexOfFirst { item ->
+                sameUrl(item.href, target.sourceUrl) || sameUrl(item.href, requestedUrl)
+            } ?: -1
+            if (index >= 0) activeCatalogIndex = index
+        }
+    }
+
     fun clearCloudflareChallenge(view: WebView? = null) {
         if (view == null || cloudflareChallengeWebView === view) {
             cloudflareChallengeWebView?.settings?.loadsImagesAutomatically = false
@@ -994,6 +1019,25 @@ private fun JingduApp(initialUrl: String = "") {
         }
     }
 
+    // Expose the live prefetch/window state so a stalled chapter chain is visible from the menu.
+    fun writeLiveStateDiagnostics() {
+        val current = document ?: return
+        val links = resolveReaderNavigationLinks(current, navigationCatalogFor(current))
+        val nextUrl = links.next?.href?.let(::normalizeUrl).orEmpty()
+        val cachedNext = nextUrl.takeIf { it.isNotEmpty() }?.let(::findCached)
+        val nextReady = cachedNext != null && cachedNext.isUsableForReading() &&
+            !cachedNext.isCatalog &&
+            (settings.pageMode == PageMode.VERTICAL || !hasUncachedPageContinuation(cachedNext))
+        recordDiagnostic(
+            "live_state",
+            current.sourceUrl,
+            "paragraphs=${current.paragraphs.size} nextLink=$nextUrl nextCached=${cachedNext != null} " +
+                "nextParagraphs=${cachedNext?.paragraphs?.size ?: 0} nextReady=$nextReady " +
+                "prefetch=$prefetchLoadUrl prefetchBase=$prefetchPageBaseUrl depth=$prefetchChapterDepth " +
+                "previous=$previousLoadUrl cached=${cachedDocuments.size} pageMode=${settings.pageMode.name}"
+        )
+    }
+
     // Chapter pages often expose only a "next page" link, with the real next chapter living on
     // the continuation page or in the catalog; fall back in that order so the reader can advance.
     fun nextChapterLink(result: ReaderDocument): ReaderLink? =
@@ -1186,6 +1230,8 @@ private fun JingduApp(initialUrl: String = "") {
         val existing = shelfBooks.firstOrNull {
             it.key == key || (it.catalogUrl.isNotBlank() && sameUrl(it.catalogUrl, catalogUrl))
         } ?: return
+        // A name the reader typed themselves wins over whatever the site calls the book.
+        if (existing.customTitle) return
         val updated = existing.copy(
             title = bookTitleForDocument(current, catalog),
             updatedAt = System.currentTimeMillis()
@@ -1267,7 +1313,8 @@ private fun JingduApp(initialUrl: String = "") {
             catalogUrl = catalogUrl,
             lastReadUrl = result.sourceUrl,
             lastChapterTitle = result.title,
-            updatedAt = System.currentTimeMillis()
+            updatedAt = System.currentTimeMillis(),
+            customTitle = existing?.customTitle == true
         )
         shelfBooks = listOf(updated) + shelfBooks.filterNot { it.key == key }
         saveShelfBooks(preferences, shelfBooks)
@@ -1309,6 +1356,7 @@ private fun JingduApp(initialUrl: String = "") {
             document = merged
             visibleDocumentForPersistence = merged
             windowRevision += 1
+            rememberActiveDocumentForPersistence(merged, current.sourceUrl)
             recordDiagnostic(
                 "chapter_merged",
                 current.sourceUrl,
@@ -1389,6 +1437,15 @@ private fun JingduApp(initialUrl: String = "") {
         // current one are ready to render before any background download finishes.
         prewarmReadingWindow(displayResult)
         prewarmActiveChapter(displayResult)
+        // A continuation offset belongs to the chapter just left, so drop it now and open the new
+        // chapter at its head; an explicit continuation (vertical promotion) keeps its own offsets.
+        if (verticalIndexOverride == null) {
+            verticalOpenIndex = null
+            verticalOpenOffset = null
+            chapterOpenPosition = openPosition
+        }
+        // Persist after prewarming so the saved chapter reflects any absorbed continuation pages.
+        document?.let { current -> rememberActiveDocumentForPersistence(current, requestedUrl) }
         preparePrevious(displayResult)
         prepareNext(displayResult)
         if (displayResult.isCatalog) startCatalogCrawl(displayResult.sourceUrl, displayResult)
@@ -1489,13 +1546,15 @@ private fun JingduApp(initialUrl: String = "") {
             val complete = mergeCachedPageChain(cached.sourceUrl) ?: cached
             if (complete.paragraphs.size > cached.paragraphs.size) windowRevision += 1
             readingOffset = savedReadingOffset(complete.sourceUrl) ?: readingOffset
+            document = complete
             currentUrl = complete.sourceUrl
             address = complete.sourceUrl
             loading = false
             errorMessage = null
-            saveCachedReaderDocument(preferences, complete)
             preparePrevious(complete)
             prepareNext(complete)
+            // Whatever the reader is showing now must be what is restored next time.
+            rememberActiveDocumentForPersistence(complete, normalized)
             return
         }
         if (cached != null) {
@@ -1680,6 +1739,30 @@ private fun JingduApp(initialUrl: String = "") {
             prefetchPageBaseUrl = ""
         }
 
+        // A later text page ("_2") links back to the page before it; merge the two so the cache
+        // entry for either page holds the whole chapter instead of only half of it.
+        val previousPageUrl = result.navigation.previousPage?.href?.let(::normalizeUrl).orEmpty()
+        val previousPage = previousPageUrl.takeIf { it.isNotEmpty() }?.let(::findCached)
+        if (previousPage != null && !previousPage.isCatalog && previousPage.paragraphs.isNotEmpty() &&
+            !sameUrl(previousPage.sourceUrl, result.sourceUrl)
+        ) {
+            val merged = mergeCachedContinuation(mergePagedDocuments(previousPage, result))
+            cacheDocument(merged, previousPage.sourceUrl)
+            cacheDocument(merged, previousPageUrl)
+            cacheDocument(merged, expected)
+            recordDiagnostic(
+                "page_merged",
+                expected,
+                "previous=${previousPage.paragraphs.size} page=${result.paragraphs.size} merged=${merged.paragraphs.size}"
+            )
+            if (document?.sourceUrl?.let { sameUrl(it, previousPage.sourceUrl) } == true) {
+                document = merged
+                visibleDocumentForPersistence = merged
+            }
+            windowRevision += 1
+            prepareNext(merged)
+            return
+        }
         cacheDocument(result, expected)
         if (uncachedPageContinuationUrl(result) != null) {
             prepareNext(result)
@@ -2183,6 +2266,9 @@ private fun JingduApp(initialUrl: String = "") {
         currentUrl = currentUrl,
         activeLoadUrl = activeLoadUrl,
         prefetchLoadUrl = prefetchLoadUrl,
+        prefetchPageBaseUrl = prefetchPageBaseUrl,
+        prefetchDepth = prefetchChapterDepth,
+        loadedChapterCount = cachedDocuments.size,
         previousLoadUrl = previousLoadUrl,
         catalogLoadUrl = catalogLoadUrl,
         pendingUrl = pendingChapterNavigation?.url,
@@ -2309,6 +2395,19 @@ private fun JingduApp(initialUrl: String = "") {
                         shelfBooks = shelfBooks.filterNot { it.key == book.key }
                         saveShelfBooks(preferences, shelfBooks)
                     },
+                    onCopyBookUrl = { book -> copyDiagnosticReport(context, book.lastReadUrl) },
+                    onShareBookUrl = { book -> shareDiagnosticReport(context, book.lastReadUrl) },
+                    onRenameBook = { book, name ->
+                        // Keep the entry where it is; only the displayed shelf name changes.
+                        shelfBooks = shelfBooks.map { existing ->
+                            if (existing.key == book.key) {
+                                existing.copy(title = name, customTitle = true)
+                            } else {
+                                existing
+                            }
+                        }
+                        saveShelfBooks(preferences, shelfBooks)
+                    },
                     onBack = { screen = AppScreen.HOME.name }
                 )
             } else {
@@ -2373,6 +2472,8 @@ private fun JingduApp(initialUrl: String = "") {
                     navigationLinks = navigationLinks,
                     previousChapterAvailable = previousChapterAvailable,
                     onLayoutTrace = { details -> recordDiagnostic("layout", "", details) },
+                    onJumpDiagnostic = { details -> recordDiagnostic("catalog_jump", "", details) },
+                    onWriteLiveState = { writeLiveStateDiagnostics() },
                     catalogDocument = cachedCatalog,
                     catalogIndex = activeCatalogIndex,
                     catalogLoading = catalogLoadUrl.isNotEmpty(),
@@ -2958,8 +3059,42 @@ private fun BookshelfScreen(
     books: List<ShelfBook>,
     onOpenBook: (ShelfBook) -> Unit,
     onRemoveBook: (ShelfBook) -> Unit,
+    onCopyBookUrl: (ShelfBook) -> Unit,
+    onShareBookUrl: (ShelfBook) -> Unit,
+    onRenameBook: (ShelfBook, String) -> Unit,
     onBack: () -> Unit
 ) {
+    var renaming by remember { mutableStateOf<ShelfBook?>(null) }
+    var renameInput by remember { mutableStateOf("") }
+    renaming?.let { book ->
+        AlertDialog(
+            onDismissRequest = { renaming = null },
+            title = { Text("重命名书籍", fontSize = 17.sp) },
+            text = {
+                OutlinedTextField(
+                    value = renameInput,
+                    onValueChange = { value -> renameInput = value.take(60) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    placeholder = { Text("输入书名") }
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val name = renameInput.trim()
+                        if (name.isNotEmpty()) {
+                            onRenameBook(book, name)
+                        }
+                        renaming = null
+                    }
+                ) { Text("保存") }
+            },
+            dismissButton = {
+                TextButton(onClick = { renaming = null }) { Text("取消") }
+            }
+        )
+    }
     val palette = IvoryPalette
     Column(
         modifier = Modifier
@@ -3027,13 +3162,39 @@ private fun BookshelfScreen(
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
+                                // The site itself is the only way back to a book that has no
+                                // catalog, so the last read URL stays visible on the shelf row.
+                                Spacer(Modifier.height(4.dp))
+                                Text(
+                                    book.lastReadUrl,
+                                    color = palette.accent,
+                                    fontSize = 10.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
                             }
-                            IconButton(onClick = { onRemoveBook(book) }) {
-                                Icon(Icons.Default.Delete, contentDescription = "移出书架", tint = palette.muted)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                IconButton(onClick = {
+                                    renameInput = book.title
+                                    renaming = book
+                                }) {
+                                    Icon(Icons.Default.Edit, contentDescription = "重命名", tint = palette.muted)
+                                }
+                                IconButton(onClick = { onCopyBookUrl(book) }) {
+                                    Icon(Icons.Default.ContentCopy, contentDescription = "复制网址", tint = palette.muted)
+                                }
+                                IconButton(onClick = { onShareBookUrl(book) }) {
+                                    Icon(Icons.Default.Share, contentDescription = "分享网址", tint = palette.muted)
+                                }
+                                IconButton(onClick = { onRemoveBook(book) }) {
+                                    Icon(Icons.Default.Delete, contentDescription = "移出书架", tint = palette.muted)
+                                }
                             }
                         }
                     }
+                    Spacer(Modifier.height(10.dp))
                 }
+                item { Spacer(Modifier.height(24.dp)) }
             }
         }
     }
@@ -3058,6 +3219,8 @@ private fun ReaderScreen(
     navigationLinks: ReaderNavigationLinks,
     previousChapterAvailable: Boolean,
     onLayoutTrace: (String) -> Unit,
+    onJumpDiagnostic: (String) -> Unit,
+    onWriteLiveState: () -> Unit,
     catalogDocument: ReaderDocument?,
     catalogIndex: Int?,
     catalogLoading: Boolean,
@@ -3082,6 +3245,8 @@ private fun ReaderScreen(
     val palette = paletteFor(settings.theme)
     var menuVisible by rememberSaveable { mutableStateOf(false) }
     var panel by rememberSaveable { mutableStateOf(ReaderPanel.NONE.name) }
+    // Bumped each time the directory opens so the drawer re-centers on the current chapter.
+    var catalogOpenGeneration by remember { mutableStateOf(0) }
     val toggleMenu = {
         menuVisible = !menuVisible
         if (!menuVisible) panel = ReaderPanel.NONE.name
@@ -3170,8 +3335,10 @@ private fun ReaderScreen(
                     previousChapterAvailable = previousChapterAvailable,
                     onCopyDiagnosticLog = onCopyDiagnosticLog,
                     onOpenCatalog = {
+                        onWriteLiveState()
                         onOpenCatalog()
                         menuVisible = false
+                        catalogOpenGeneration += 1
                         panel = ReaderPanel.CATALOG.name
                     },
                     isInBookshelf = isInBookshelf,
@@ -3208,11 +3375,14 @@ private fun ReaderScreen(
                     onCopyDiagnosticLog = onCopyDiagnosticLog,
                      onShareDiagnosticLog = onShareDiagnosticLog,
                      onNavigate = { href, index ->
-                        panel = ReaderPanel.NONE.name
+                        // Keep the directory open after jumping so the reader can keep browsing
+                        // its entries; close it manually to return to the chapter text.
                         onNavigateFromCatalog(href, catalogDocument?.sourceUrl.orEmpty(), index)
                     },
                 onRetryCatalog = onRetryCatalog,
                     onClose = { panel = ReaderPanel.NONE.name },
+                    openGeneration = catalogOpenGeneration,
+                    onJumpDiagnostic = onJumpDiagnostic,
                     modifier = Modifier.align(Alignment.CenterStart)
                 )
             }
@@ -3468,6 +3638,8 @@ private fun CatalogDrawer(
     onCopyDiagnosticLog: () -> Unit,
     onShareDiagnosticLog: () -> Unit,
     onClose: () -> Unit,
+    openGeneration: Int = 0,
+    onJumpDiagnostic: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val currentUrl = currentDocument?.sourceUrl.orEmpty()
@@ -3489,28 +3661,44 @@ private fun CatalogDrawer(
     val currentIndex = indexedPosition ?: matchedIndex
     val listState = rememberLazyListState()
     var positionedKey by remember(catalogDocument?.sourceUrl) { mutableStateOf("") }
+    var pendingPosition by remember(catalogDocument?.sourceUrl) { mutableStateOf<Int?>(null) }
+    // Re-centering is keyed on the open generation too, so every time the directory slides in it
+    // lands on the chapter being read instead of keeping the previous scroll position.
     LaunchedEffect(
         catalogDocument?.sourceUrl,
         catalogItemCount,
         catalogLastItemKey,
         currentUrl,
         currentTitle,
-        currentIndex
+        currentIndex,
+        openGeneration
     ) {
         if (currentIndex >= 0) {
             val targetKey = "${catalogDocument?.sourceUrl}:$currentIndex"
-            if (positionedKey != targetKey) {
-                val targetIndex = currentIndex + 1
-                listState.scrollToItem(targetIndex)
-                val targetItem = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == targetIndex }
-                if (targetItem != null) {
-                    val viewportHeight = (listState.layoutInfo.viewportEndOffset - listState.layoutInfo.viewportStartOffset)
-                        .coerceAtLeast(targetItem.size)
-                    val centerOffset = -((viewportHeight - targetItem.size) / 2)
-                    listState.scrollToItem(targetIndex, centerOffset)
-                }
+            if (positionedKey != targetKey || openGeneration > 0) {
+                // Header entry occupies index 0 in the list.
+                listState.scrollToItem(currentIndex + 1)
+                pendingPosition = currentIndex + 1
                 positionedKey = targetKey
             }
+        }
+    }
+    // Center the current chapter once its row is actually laid out; the first scroll often runs
+    // before the row has a measured size.
+    LaunchedEffect(listState, pendingPosition) {
+        val target = pendingPosition ?: return@LaunchedEffect
+        listState.scrollToItem(target)
+        repeat(6) { attempt ->
+            val info = listState.layoutInfo
+            val item = info.visibleItemsInfo.firstOrNull { it.index == target }
+            if (item != null) {
+                val viewportHeight = info.viewportEndOffset - info.viewportStartOffset
+                val centerOffset = ((viewportHeight - item.size) / 2).coerceAtLeast(0)
+                listState.scrollToItem(target, -centerOffset)
+                pendingPosition = null
+                return@LaunchedEffect
+            }
+            if (attempt > 0) delay(32L)
         }
     }
 
@@ -3559,6 +3747,7 @@ private fun CatalogDrawer(
                 }
                 if (catalogDocument != null && catalogDocument.catalogItems.isNotEmpty()) {
                     var jumpInput by remember(catalogDocument.sourceUrl) { mutableStateOf("") }
+                    var jumpHint by remember(catalogDocument.sourceUrl) { mutableStateOf("") }
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -3578,10 +3767,24 @@ private fun CatalogDrawer(
                             onClick = {
                                 val requested = jumpInput.toIntOrNull()
                                 val target = requested?.let { chapterItemForNumber(catalogDocument.catalogItems, it) }
-                                target?.let { item ->
-                                    val index = catalogDocument.catalogItems.indexOf(item)
-                                    onNavigate(item.href, index)
-                                    onClose()
+                                if (target != null) {
+                                    // Resolve the index from the entry itself so the catalog camera
+                                    // and the opened chapter always agree on the target.
+                                    val index = catalogDocument.catalogItems.indexOfFirst { item ->
+                                        readerUrlKey(item.href) == readerUrlKey(target.href)
+                                    }.takeIf { it >= 0 } ?: catalogDocument.catalogItems.indexOf(target)
+                                    jumpHint = "已跳转 ${target.label}（第 ${index + 1} 项）"
+                                    onJumpDiagnostic(
+                                        "jump_request requested=$requested index=$index label=${target.label} href=${target.href} total=${catalogDocument.catalogItems.size}"
+                                    )
+                                    onNavigate(target.href, index)
+                                } else {
+                                    // Never fail silently: say why the chapter cannot be opened yet.
+                                    jumpHint = when {
+                                        requested == null || requested <= 0 -> "请输入大于 0 的章节序号"
+                                        !complete -> "已加载 ${catalogDocument.catalogItems.size} 章，目录还在后台加载，稍后再试"
+                                        else -> "目录里没有第 ${requested} 章，当前共 ${catalogDocument.catalogItems.size} 章"
+                                    }
                                 }
                             },
                             enabled = jumpInput.isNotEmpty(),
@@ -3589,6 +3792,14 @@ private fun CatalogDrawer(
                         ) {
                             Text("跳转", fontSize = 13.sp)
                         }
+                    }
+                    if (jumpHint.isNotEmpty()) {
+                        Text(
+                            jumpHint,
+                            color = palette.muted,
+                            fontSize = 10.sp,
+                            modifier = Modifier.padding(start = 17.dp, end = 12.dp, bottom = 6.dp)
+                        )
                     }
                 }
                 when {
@@ -4161,21 +4372,21 @@ private fun VerticalChapterView(
                 if (firstVisible < 0 || viewport.scrolling) return@collectLatest
                 if (scrollGeneration <= lastHandledUserScrollGeneration) return@collectLatest
                 lastHandledUserScrollGeneration = scrollGeneration
+                // Promote as soon as the viewport crosses the seam into the attached next chapter,
+                // not only at the very bottom of the list (which is the END of the next chapter).
+                if (nextChapter != null && nextChapterReady && firstVisible >= nextStartIndex) {
+                    onContinueToChapter(
+                        nextChapter.sourceUrl,
+                        (firstVisible - nextStartIndex).coerceIn(0, nextChapter.paragraphs.size),
+                        viewport.firstOffset
+                    )
+                    return@collectLatest
+                }
                 if (!viewport.canScrollForward) {
-                    when {
-                        nextChapter == null || !nextChapterReady -> {
-                            if (viewport.lastVisible >= currentEndIndex) {
-                                // The next chapter or its remaining page chain is still loading.
-                                onAutoNext()
-                            }
-                        }
-                        firstVisible >= nextStartIndex -> {
-                            // Promote the attached chapter at its visible position so the list does not jump.
-                            onContinueToChapter(
-                                nextChapter.sourceUrl,
-                                (firstVisible - nextStartIndex).coerceIn(0, nextChapter.paragraphs.size),
-                                viewport.firstOffset
-                            )
+                    if (nextChapter == null || !nextChapterReady) {
+                        if (viewport.lastVisible >= currentEndIndex) {
+                            // The next chapter or its remaining page chain is still loading.
+                            onAutoNext()
                         }
                     }
                     return@collectLatest
