@@ -8,6 +8,40 @@ object ReaderScript {
         }))()
     """.trimIndent()
 
+    // Collects search result entries so the search tab can offer "save to shelf" without opening a
+    // dedicated API. Handles Bing/Baidu style result blocks, then falls back to a generic pass.
+    val searchResults = """
+        (() => {
+          const out = [];
+          const seen = new Set();
+          const push = (title, href) => {
+            const name = String(title || '').replace(/\s+/g, ' ').trim();
+            if (!name || name.length < 2 || name.length > 90) return;
+            if (!href || !/^https?:/i.test(href)) return;
+            if (/bing\.com|baidu\.com|google\.|microsoft\.com|msn\.com/.test(href)) return;
+            if (seen.has(href)) return;
+            seen.add(href);
+            out.push({ title: name, href });
+          };
+          document.querySelectorAll('#b_results > li.b_algo, .result, .c-container').forEach((block) => {
+            const anchor = block.querySelector('h2 a[href], h3 a[href], a[href]');
+            if (!anchor) return;
+            const heading = block.querySelector('h2, h3');
+            push(heading ? heading.textContent : anchor.textContent, anchor.href);
+          });
+          if (!out.length) {
+            document.querySelectorAll('a[href]').forEach((anchor) => {
+              const heading = anchor.querySelector('h3,h2');
+              const href = anchor.href || '';
+              if (!heading) return;
+              if (!/^https?:/i.test(href)) return;
+              push(heading.textContent, href);
+            });
+          }
+          return JSON.stringify({ url: location.href, title: document.title || '', results: out.slice(0, 30) });
+        })()
+    """.trimIndent()
+
     val extract = """
         (() => {
           const NOISE = 'script,style,noscript,template,iframe,canvas,svg,nav,aside,header,footer,form,button,input,textarea,select,option,[role="navigation"],[role="complementary"],[aria-hidden="true"],[hidden],.topbar,.header,.nav,.m-nav,.m-setting,.footer,.hotcmd-wp,.hotcmd-box,.ad,.ads,.advert,.advertisement,.adsbygoogle,.ad-container,[class*="ad-"],[class*="-ad"],[id*="ad-"],[id*="-ad"],.popup,.modal,.overlay,.recommend,.recommendation,.related,.share,.social,.comment,.comments,.toolbar,.pagination,.chapter-nav,.breadcrumb,.notice,.copyright';

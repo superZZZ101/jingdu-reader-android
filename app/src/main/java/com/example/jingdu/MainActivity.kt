@@ -25,7 +25,10 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -38,6 +41,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -61,6 +65,8 @@ import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.MenuBook
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Refresh
@@ -91,6 +97,7 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.graphics.toArgb
@@ -106,6 +113,7 @@ import androidx.compose.ui.text.style.LineBreak
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -128,6 +136,15 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 private enum class AppScreen { HOME, READER, BOOKSHELF }
+
+// Main-area tabs shown in the bottom bar; the reader is a full-screen destination above them.
+private enum class HomeTab { HOME, SHELF, SEARCH, SETTINGS }
+
+private const val DefaultSearchSite = "www.weimangguo.com"
+
+private data class SearchResult(val title: String, val href: String)
+
+private enum class SearchEngine { BING, BAIDU }
 private enum class ReaderTheme { IVORY, PAPER, NIGHT }
 private enum class PageMode { VERTICAL, HORIZONTAL }
 private enum class HorizontalTapMode { SIDE_PAGES, BOTH_NEXT }
@@ -504,10 +521,21 @@ private fun JingduApp(initialUrl: String = "") {
     val restoredDocument = remember { loadCachedReaderDocument(preferences) }
     val restoredCatalogDocument = remember { loadCachedCatalogDocument(preferences) }
     var screen by rememberSaveable {
-        mutableStateOf(
-            if (initialUrl.isBlank() && restoredDocument != null) AppScreen.READER.name else AppScreen.HOME.name
-        )
+        // Start on the tabbed main area; a saved book only continues reading when opened explicitly
+        // or when the app is launched from a shared link.
+        mutableStateOf(if (initialUrl.isNotBlank()) AppScreen.READER.name else AppScreen.HOME.name)
     }
+    var homeTab by rememberSaveable { mutableStateOf(HomeTab.HOME.name) }
+    var searchWebView by remember { mutableStateOf<WebView?>(null) }
+    var searchWebViewGeneration by remember { mutableStateOf(0) }
+    var searchLoadUrl by remember { mutableStateOf("") }
+    var searchLoading by remember { mutableStateOf(false) }
+    var searchErrorMessage by remember { mutableStateOf<String?>(null) }
+    var searchResults by remember { mutableStateOf(emptyList<SearchResult>()) }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
+    var searchSite by rememberSaveable { mutableStateOf(DefaultSearchSite) }
+    var searchEngine by remember { mutableStateOf(SearchEngine.BING) }
+    var searchResultRetries by remember { mutableStateOf(0) }
     var address by rememberSaveable {
         mutableStateOf(initialUrl.ifBlank { restoredDocument?.sourceUrl.orEmpty() })
     }
@@ -1020,6 +1048,87 @@ private fun JingduApp(initialUrl: String = "") {
     }
 
     // Expose the live prefetch/window state so a stalled chapter chain is visible from the menu.
+    fun parseSearchResults(rawPayload: String?): List<SearchResult>? {
+        val payload = rawPayload.orEmpty().trim()
+        if (payload.isEmpty() || payload == "null") return null
+        val json = runCatching {
+            val value = org.json.JSONTokener(payload).nextValue()
+            if (value is String) org.json.JSONObject(value) else value as? org.json.JSONObject
+        }.getOrNull() ?: return null
+        val items = json.optJSONArray("results") ?: return emptyList()
+        return buildList(items.length()) {
+            for (index in 0 until items.length()) {
+                val item = items.optJSONObject(index) ?: continue
+                val title = item.optString("title").trim()
+                val href = item.optString("href").trim()
+                if (title.isEmpty() || href.isEmpty()) continue
+                add(SearchResult(title = title, href = href))
+            }
+        }
+    }
+
+    fun startSearch(query: String, site: String) {
+        val keyword = query.trim()
+        if (keyword.isEmpty()) {
+            searchResults = emptyList()
+            searchLoading = false
+            searchErrorMessage = "请输入书名或关键词"
+            return
+        }
+        val host = site.trim().removePrefix("https://").removePrefix("http://").trimEnd('/')
+        val term = if (host.isNotEmpty()) "$keyword site:$host" else keyword
+        val encoded = java.net.URLEncoder.encode(term, "UTF-8")
+        searchResults = emptyList()
+        searchErrorMessage = null
+        searchLoading = true
+        searchEngine = SearchEngine.BING
+        searchResultRetries = 0
+        searchWebViewGeneration += 1
+        searchLoadUrl = "https://cn.bing.com/search?q=$encoded&count=20"
+        recordDiagnostic("search_start", searchLoadUrl, "query=$keyword site=$host engine=bing")
+    }
+
+    // Bing occasionally returns an empty page for this network; Baidu is the fallback engine.
+    fun fallbackSearchToBaidu() {
+        if (searchEngine != SearchEngine.BING) return
+        val query = searchQuery.trim()
+        if (query.isEmpty()) return
+        val host = searchSite.trim().removePrefix("https://").removePrefix("http://").trimEnd('/')
+        val term = if (host.isNotEmpty()) "$query site:$host" else query
+        searchEngine = SearchEngine.BAIDU
+        searchResultRetries = 0
+        searchLoading = true
+        searchErrorMessage = null
+        searchWebViewGeneration += 1
+        searchLoadUrl = "https://www.baidu.com/s?wd=" + java.net.URLEncoder.encode(term, "UTF-8") + "&rn=20"
+        recordDiagnostic("search_fallback", searchLoadUrl, "engine=baidu")
+    }
+
+    // Saving a search hit keeps the entry minimal; the catalog resolves once the book is opened.
+    fun saveSearchResultToShelf(result: SearchResult) {
+        val url = normalizeUrl(result.href)
+        if (url.isEmpty()) return
+        val key = "site:" + (url.substringAfter("//", url).substringBefore('/'))
+        val title = result.title.takeIf { it.isNotBlank() } ?: url
+        if (shelfBooks.any { sameUrl(it.lastReadUrl, url) }) {
+            homeTab = HomeTab.SHELF.name
+            return
+        }
+        val entry = ShelfBook(
+            key = key,
+            title = title,
+            catalogUrl = "",
+            lastReadUrl = url,
+            lastChapterTitle = "尚未记录章节",
+            updatedAt = System.currentTimeMillis(),
+            customTitle = true
+        )
+        shelfBooks = listOf(entry) + shelfBooks
+        saveShelfBooks(preferences, shelfBooks)
+        homeTab = HomeTab.SHELF.name
+        recordDiagnostic("shelf_add_from_search", url, "title=$title")
+    }
+
     fun writeLiveStateDiagnostics() {
         val current = document ?: return
         val links = resolveReaderNavigationLinks(current, navigationCatalogFor(current))
@@ -2260,6 +2369,37 @@ private fun JingduApp(initialUrl: String = "") {
         }
     }
 
+    LaunchedEffect(searchWebView, searchLoadUrl) {
+        val target = searchLoadUrl
+        val view = searchWebView
+        if (view != null && target.isNotEmpty()) {
+            when {
+                webViewLoadTarget(view).isNotEmpty() && !sameUrl(webViewLoadTarget(view), target) -> {
+                    searchWebViewGeneration += 1
+                }
+                webViewLoadTarget(view).isEmpty() -> {
+                    view.stopLoading()
+                    startWebViewLoad(view, target, "")
+                }
+            }
+        }
+    }
+
+    // A search that never produced usable results must not leave the tab spinning forever.
+    LaunchedEffect(searchLoadUrl, searchWebViewGeneration) {
+        if (searchLoadUrl.isEmpty() || !searchLoading) return@LaunchedEffect
+        delay(25_000)
+        if (!searchLoading) return@LaunchedEffect
+        if (searchResults.isEmpty() && searchEngine == SearchEngine.BING) {
+            fallbackSearchToBaidu()
+            return@LaunchedEffect
+        }
+        searchLoading = false
+        if (searchResults.isEmpty() && searchErrorMessage == null) {
+            searchErrorMessage = "搜索超时：搜索站点可能被拦截，换个关键词或稍后再试"
+        }
+    }
+
     val diagnosticReport = buildDiagnosticReport(
         errorMessage = errorMessage,
         logs = diagnosticLogs,
@@ -2367,23 +2507,74 @@ private fun JingduApp(initialUrl: String = "") {
                     update = { catalogWebView = it }
                 )
             }
+            key(searchWebViewGeneration) {
+                AndroidView(
+                    modifier = Modifier.size(1.dp).alpha(0f),
+                    factory = { viewContext ->
+                        createReaderWebView(
+                            context = viewContext,
+                            label = "search",
+                            onTrace = { name, details -> recordDiagnostic("web_$name", "", details) },
+                            onPayload = { view, requestToken, pageUrl, rawPayload ->
+                                var accepted = false
+                                if (requestToken != 0L && requestToken == webViewLoadToken(view)) {
+                                    val payload = parseSearchResults(rawPayload)
+                                    if (payload != null && payload.isNotEmpty()) {
+                                        searchResults = payload
+                                        searchLoading = false
+                                        searchErrorMessage = null
+                                        accepted = true
+                                    } else if (payload != null) {
+                                        // Search pages render their result list asynchronously, so an
+                                        // empty parse is retried before falling back to another engine.
+                                        if (searchResults.isEmpty() && searchResultRetries < 2) {
+                                            searchResultRetries += 1
+                                            view.postDelayed({
+                                                if (requestToken != webViewLoadToken(view)) return@postDelayed
+                                                view.evaluateJavascript(ReaderScript.searchResults) { retried ->
+                                                    val retryPayload = parseSearchResults(retried)
+                                                    if (retryPayload != null && retryPayload.isNotEmpty()) {
+                                                        searchResults = retryPayload
+                                                        searchLoading = false
+                                                        searchErrorMessage = null
+                                                    }
+                                                }
+                                            }, 2_500L)
+                                        } else if (searchResults.isEmpty() &&
+                                            searchEngine == SearchEngine.BING
+                                        ) {
+                                            fallbackSearchToBaidu()
+                                        } else if (searchResults.isEmpty()) {
+                                            searchLoading = false
+                                            searchErrorMessage = "没有找到书籍页，换个书名或换个限定站点试试"
+                                        }
+                                        accepted = true
+                                    }
+                                }
+                                accepted
+                            },
+                            onError = { _, _, _, reason ->
+                                searchLoading = false
+                                searchErrorMessage = "搜索失败：$reason"
+                                recordDiagnostic("search_error", searchLoadUrl, reason)
+                            },
+                            extractScript = ReaderScript.searchResults
+                        ).also { searchWebView = it }
+                    },
+                    update = { searchWebView = it }
+                )
+            }
 
             if (screen == AppScreen.HOME.name) {
-                HomeScreen(
+                HomeScaffold(
+                    palette = IvoryPalette,
+                    activeTab = homeTab,
+                    onTabChange = { homeTab = it },
                     address = address,
                     onAddressChange = { address = it },
-                    onOpen = { openUrl(address) },
+                    onOpenAddress = { openUrl(address) },
                     recentUrl = preferences.getString("last_url", null),
-                    shelfCount = shelfBooks.size,
-                    onOpenBookshelf = { screen = AppScreen.BOOKSHELF.name },
                     onOpenRecent = { openUrl(it) },
-                    onCheckForUpdate = { requestUpdateCheck() },
-                    updateChecking = updateChecking,
-                    updateStatusMessage = updateStatusMessage
-                )
-            } else if (screen == AppScreen.BOOKSHELF.name) {
-                BackHandler { screen = AppScreen.HOME.name }
-                BookshelfScreen(
                     books = shelfBooks,
                     onOpenBook = { book ->
                         openUrl(
@@ -2408,7 +2599,30 @@ private fun JingduApp(initialUrl: String = "") {
                         }
                         saveShelfBooks(preferences, shelfBooks)
                     },
-                    onBack = { screen = AppScreen.HOME.name }
+                    searchQuery = searchQuery,
+                    onSearchQueryChange = { searchQuery = it },
+                    searchSite = searchSite,
+                    onSearchSiteChange = { searchSite = it },
+                    onSearch = { query, site ->
+                        searchQuery = query
+                        searchSite = site
+                        startSearch(query, site)
+                    },
+                    searchLoading = searchLoading,
+                    searchError = searchErrorMessage,
+                    searchResults = searchResults,
+                    searchInShelf = { href -> shelfBooks.any { sameUrl(it.lastReadUrl, href) } },
+                    onOpenSearchResult = { result -> openUrl(result.href) },
+                    onSaveSearchResult = { result -> saveSearchResultToShelf(result) },
+                    settings = settings,
+                    onSettingsChange = { updatedSettings ->
+                        settings = updatedSettings
+                        saveSettings(preferences, updatedSettings)
+                        activity?.requestedOrientation = updatedSettings.screenOrientation.toRequestedOrientation()
+                    },
+                    onCheckForUpdate = { requestUpdateCheck() },
+                    updateChecking = updateChecking,
+                    updateStatusMessage = updateStatusMessage
                 )
             } else {
                 val baseCatalogUrl = document?.navigation?.catalog?.href?.let(::normalizeUrl).orEmpty()
@@ -2704,7 +2918,8 @@ private fun createReaderWebView(
     label: String,
     onTrace: (String, String) -> Unit,
     onPayload: (WebView, Long, String, String) -> Boolean,
-    onError: (WebView, Long, String, String) -> Unit
+    onError: (WebView, Long, String, String) -> Unit,
+    extractScript: String = ReaderScript.extract
 ): WebView {
     return WebView(context).apply {
         var nativeFallbackToken = 0L
@@ -2771,6 +2986,10 @@ private fun createReaderWebView(
 
         fun tryNativeFallback(view: WebView, url: String, requestToken: Long, reason: String) {
             if (requestToken == 0L || nativeFallbackToken == requestToken || cloudflareChallengeToken == requestToken) return
+            // A stale timer must never interrupt newer work: the page may already have been parsed,
+            // or the view may have moved on to the chapter's next text page.
+            if (acceptedPayloadToken == requestToken) return
+            if (webViewLoadToken(view) != requestToken) return
             nativeFallbackToken = requestToken
             if (url != nativeFallbackUrl) {
                 nativeFallbackUrl = url
@@ -2792,11 +3011,11 @@ private fun createReaderWebView(
                 view.post {
                     if (nativeFallbackInFlightToken != requestToken || requestToken != webViewLoadToken(view)) return@post
                     nativeFallbackInFlightToken = 0L
-                    if (html != null) {
+                    if (html != null && acceptedPayloadToken != requestToken) {
                         view.stopLoading()
                         view.tag = ReaderWebViewLoad(nextReaderWebViewToken(), url, referer)
                         view.loadDataWithBaseURL(url, html, "text/html", "UTF-8", url)
-                    } else {
+                    } else if (html == null) {
                         reportError(view, requestToken, url, "$reason;native_fallback_failed")
                     }
                 }
@@ -2832,7 +3051,7 @@ private fun createReaderWebView(
                         onTrace(label, "extract_skip token=$requestToken loaded=$currentUrl")
                         return@postDelayed
                     }
-                    view.evaluateJavascript(ReaderScript.extract) { rawPayload ->
+                    view.evaluateJavascript(extractScript) { rawPayload ->
                         if (onPayload(view, requestToken, url, rawPayload)) {
                             acceptedPayloadToken = requestToken
                             if (nativeFallbackInFlightToken == requestToken) nativeFallbackInFlightToken = 0L
@@ -2954,14 +3173,103 @@ private fun createReaderWebView(
 }
 
 @Composable
-private fun HomeScreen(
+private fun HomeScaffold(
+    palette: ReaderPalette,
+    activeTab: String,
+    onTabChange: (String) -> Unit,
     address: String,
     onAddressChange: (String) -> Unit,
-    onOpen: () -> Unit,
+    onOpenAddress: () -> Unit,
     recentUrl: String?,
-    shelfCount: Int,
-    onOpenBookshelf: () -> Unit,
     onOpenRecent: (String) -> Unit,
+    books: List<ShelfBook>,
+    onOpenBook: (ShelfBook) -> Unit,
+    onRemoveBook: (ShelfBook) -> Unit,
+    onCopyBookUrl: (ShelfBook) -> Unit,
+    onShareBookUrl: (ShelfBook) -> Unit,
+    onRenameBook: (ShelfBook, String) -> Unit,
+    searchQuery: String,
+    onSearchQueryChange: (String) -> Unit,
+    searchSite: String,
+    onSearchSiteChange: (String) -> Unit,
+    onSearch: (String, String) -> Unit,
+    searchLoading: Boolean,
+    searchError: String?,
+    searchResults: List<SearchResult>,
+    searchInShelf: (String) -> Boolean,
+    onOpenSearchResult: (SearchResult) -> Unit,
+    onSaveSearchResult: (SearchResult) -> Unit,
+    settings: ReaderSettings,
+    onSettingsChange: (ReaderSettings) -> Unit,
+    onCheckForUpdate: () -> Unit,
+    updateChecking: Boolean,
+    updateStatusMessage: String?
+) {
+    Column(modifier = Modifier.fillMaxSize().background(palette.background)) {
+        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+            when (activeTab) {
+                HomeTab.SHELF.name -> ShelfTab(
+                    palette = palette,
+                    books = books,
+                    onOpenBook = onOpenBook,
+                    onRemoveBook = onRemoveBook,
+                    onCopyBookUrl = onCopyBookUrl,
+                    onShareBookUrl = onShareBookUrl,
+                    onRenameBook = onRenameBook
+                )
+                HomeTab.SEARCH.name -> SearchTab(
+                    palette = palette,
+                    query = searchQuery,
+                    onQueryChange = onSearchQueryChange,
+                    site = searchSite,
+                    onSiteChange = onSearchSiteChange,
+                    onSearch = onSearch,
+                    loading = searchLoading,
+                    error = searchError,
+                    results = searchResults,
+                    inShelf = searchInShelf,
+                    onOpen = onOpenSearchResult,
+                    onSave = onSaveSearchResult
+                )
+                HomeTab.SETTINGS.name -> SettingsTab(
+                    palette = palette,
+                    settings = settings,
+                    onSettingsChange = onSettingsChange,
+                    onCheckForUpdate = onCheckForUpdate,
+                    updateChecking = updateChecking,
+                    updateStatusMessage = updateStatusMessage
+                )
+                else -> MainHomeTab(
+                    palette = palette,
+                    address = address,
+                    onAddressChange = onAddressChange,
+                    onOpenAddress = onOpenAddress,
+                    recentUrl = recentUrl,
+                    onOpenRecent = onOpenRecent,
+                    shelfCount = books.size,
+                    onOpenShelf = { onTabChange(HomeTab.SHELF.name) },
+                    onOpenSearch = { onTabChange(HomeTab.SEARCH.name) },
+                    onCheckForUpdate = onCheckForUpdate,
+                    updateChecking = updateChecking,
+                    updateStatusMessage = updateStatusMessage
+                )
+            }
+        }
+        BottomTabBar(palette = palette, activeTab = activeTab, onTabChange = onTabChange)
+    }
+}
+
+@Composable
+private fun MainHomeTab(
+    palette: ReaderPalette,
+    address: String,
+    onAddressChange: (String) -> Unit,
+    onOpenAddress: () -> Unit,
+    recentUrl: String?,
+    onOpenRecent: (String) -> Unit,
+    shelfCount: Int,
+    onOpenShelf: () -> Unit,
+    onOpenSearch: () -> Unit,
     onCheckForUpdate: () -> Unit,
     updateChecking: Boolean,
     updateStatusMessage: String?
@@ -2969,10 +3277,8 @@ private fun HomeScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(IvoryPalette.background)
-            .navigationBarsPadding()
-            .padding(horizontal = 24.dp),
-        verticalArrangement = Arrangement.Center
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 22.dp, vertical = 26.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Surface(
@@ -2987,22 +3293,12 @@ private fun HomeScreen(
             }
             Spacer(Modifier.width(12.dp))
             Column {
-                Text("静读", fontSize = 25.sp, fontWeight = FontWeight.Bold, color = IvoryPalette.ink)
-                Text("手机端阅读模式", fontSize = 12.sp, color = IvoryPalette.muted)
+                Text("静读", fontSize = 25.sp, fontWeight = FontWeight.Bold, color = palette.ink)
+                Text("手机端阅读模式", fontSize = 12.sp, color = palette.muted)
             }
         }
-        Spacer(Modifier.height(28.dp))
-        OutlinedButton(
-            onClick = onOpenBookshelf,
-            modifier = Modifier.fillMaxWidth().height(46.dp),
-            shape = RoundedCornerShape(9.dp)
-        ) {
-            Icon(Icons.Default.Bookmark, contentDescription = null)
-            Spacer(Modifier.width(8.dp))
-            Text("书架${if (shelfCount > 0) " · $shelfCount 本" else ""}", fontSize = 14.sp)
-        }
-        Spacer(Modifier.height(28.dp))
-        Text("打开小说网页", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = IvoryPalette.muted)
+        Spacer(Modifier.height(22.dp))
+        Text("打开小说网页", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = palette.muted)
         Spacer(Modifier.height(9.dp))
         OutlinedTextField(
             value = address,
@@ -3014,7 +3310,7 @@ private fun HomeScreen(
         )
         Spacer(Modifier.height(12.dp))
         Button(
-            onClick = onOpen,
+            onClick = onOpenAddress,
             modifier = Modifier.fillMaxWidth().height(50.dp),
             shape = RoundedCornerShape(9.dp),
             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF226B59))
@@ -3022,6 +3318,19 @@ private fun HomeScreen(
             Icon(Icons.Default.ArrowForward, contentDescription = null)
             Spacer(Modifier.width(8.dp))
             Text("打开并整理", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+        }
+        Spacer(Modifier.height(14.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            OutlinedButton(onClick = onOpenShelf, modifier = Modifier.weight(1f), shape = RoundedCornerShape(9.dp)) {
+                Icon(Icons.Default.Bookmark, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("书架${if (shelfCount > 0) " · $shelfCount" else ""}", fontSize = 13.sp)
+            }
+            OutlinedButton(onClick = onOpenSearch, modifier = Modifier.weight(1f), shape = RoundedCornerShape(9.dp)) {
+                Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("搜索找书", fontSize = 13.sp)
+            }
         }
         Spacer(Modifier.height(10.dp))
         OutlinedButton(
@@ -3036,21 +3345,374 @@ private fun HomeScreen(
         }
         updateStatusMessage?.let { message ->
             Spacer(Modifier.height(7.dp))
-            Text(message, fontSize = 11.sp, color = IvoryPalette.muted)
+            Text(message, fontSize = 11.sp, color = palette.muted)
         }
         if (!recentUrl.isNullOrBlank()) {
-            Spacer(Modifier.height(28.dp))
-            Text("上次打开", fontSize = 11.sp, color = IvoryPalette.muted)
+            Spacer(Modifier.height(22.dp))
+            Text("上次打开", fontSize = 11.sp, color = palette.muted)
             TextButton(onClick = { onOpenRecent(recentUrl) }, contentPadding = PaddingValues(0.dp)) {
-                Text(recentUrl, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color(0xFF226B59))
+                Text(recentUrl, maxLines = 1, overflow = TextOverflow.Ellipsis, color = palette.accent)
             }
         }
-        Spacer(Modifier.height(32.dp))
-        Text(
-            "正文只在本机整理 · 不上传页面内容",
-            fontSize = 11.sp,
-            color = IvoryPalette.muted
+        Spacer(Modifier.height(24.dp))
+        Text("正文只在本机整理 · 不上传页面内容", fontSize = 11.sp, color = palette.muted)
+    }
+}
+
+@Composable
+private fun BottomTabBar(
+    palette: ReaderPalette,
+    activeTab: String,
+    onTabChange: (String) -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = palette.surface,
+        border = BorderStroke(1.dp, palette.border)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(vertical = 6.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            TabBarItem(Icons.Default.Home, "首页", activeTab == HomeTab.HOME.name, palette) { onTabChange(HomeTab.HOME.name) }
+            TabBarItem(Icons.Default.Bookmark, "书架", activeTab == HomeTab.SHELF.name, palette) { onTabChange(HomeTab.SHELF.name) }
+            TabBarItem(Icons.Default.Search, "搜索", activeTab == HomeTab.SEARCH.name, palette) { onTabChange(HomeTab.SEARCH.name) }
+            TabBarItem(Icons.Default.Settings, "设置", activeTab == HomeTab.SETTINGS.name, palette) { onTabChange(HomeTab.SETTINGS.name) }
+        }
+    }
+}
+
+@Composable
+private fun TabBarItem(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    selected: Boolean,
+    palette: ReaderPalette,
+    onClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .clip(RoundedCornerShape(9.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 4.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Icon(icon, contentDescription = label, tint = if (selected) palette.accent else palette.muted, modifier = Modifier.size(21.dp))
+        Spacer(Modifier.height(2.dp))
+        Text(label, fontSize = 11.sp, color = if (selected) palette.accent else palette.muted)
+    }
+}
+
+@Composable
+private fun ShelfTab(
+    palette: ReaderPalette,
+    books: List<ShelfBook>,
+    onOpenBook: (ShelfBook) -> Unit,
+    onRemoveBook: (ShelfBook) -> Unit,
+    onCopyBookUrl: (ShelfBook) -> Unit,
+    onShareBookUrl: (ShelfBook) -> Unit,
+    onRenameBook: (ShelfBook, String) -> Unit
+) {
+    var renaming by remember { mutableStateOf<ShelfBook?>(null) }
+    var renameInput by remember { mutableStateOf("") }
+    var revealedKey by remember { mutableStateOf<String?>(null) }
+    renaming?.let { book ->
+        AlertDialog(
+            onDismissRequest = { renaming = null },
+            title = { Text("重命名书籍", fontSize = 17.sp) },
+            text = {
+                OutlinedTextField(
+                    value = renameInput,
+                    onValueChange = { value -> renameInput = value.take(60) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    placeholder = { Text("输入书名") }
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val name = renameInput.trim()
+                    if (name.isNotEmpty()) onRenameBook(book, name)
+                    renaming = null
+                }) { Text("保存") }
+            },
+            dismissButton = { TextButton(onClick = { renaming = null }) { Text("取消") } }
         )
+    }
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("书架", color = palette.ink, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.width(10.dp))
+            Text("${books.size} 本书 · 左滑可改名/复制/分享/移除", color = palette.muted, fontSize = 11.sp)
+        }
+        if (books.isEmpty()) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(Icons.Default.Bookmark, contentDescription = null, tint = palette.muted, modifier = Modifier.size(36.dp))
+                    Spacer(Modifier.height(12.dp))
+                    Text("书架为空", color = palette.ink, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.height(6.dp))
+                    Text("从首页或搜索页加入书籍", color = palette.muted, fontSize = 12.sp)
+                }
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                items(books, key = { it.key }) { book ->
+                    ShelfBookRow(
+                        palette = palette,
+                        book = book,
+                        revealed = revealedKey == book.key,
+                        onRevealChange = { revealed -> revealedKey = if (revealed) book.key else null },
+                        onOpen = { onOpenBook(book) },
+                        onRename = {
+                            renameInput = book.title
+                            renaming = book
+                        },
+                        onCopy = { onCopyBookUrl(book) },
+                        onShare = { onShareBookUrl(book) },
+                        onRemove = { onRemoveBook(book) }
+                    )
+                }
+                item { Spacer(Modifier.height(20.dp)) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ShelfBookRow(
+    palette: ReaderPalette,
+    book: ShelfBook,
+    revealed: Boolean,
+    onRevealChange: (Boolean) -> Unit,
+    onOpen: () -> Unit,
+    onRename: () -> Unit,
+    onCopy: () -> Unit,
+    onShare: () -> Unit,
+    onRemove: () -> Unit
+) {
+    var dragOffset by remember(book.key) { mutableStateOf(0f) }
+    val actionWidth = with(androidx.compose.ui.platform.LocalDensity.current) { 168.dp.toPx() }
+    LaunchedEffect(revealed) {
+        dragOffset = if (revealed) -actionWidth else 0f
+    }
+    Box(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))) {
+        Row(
+            modifier = Modifier.matchParentSize(),
+            horizontalArrangement = Arrangement.End,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            ShelfRowAction(Icons.Default.Edit, "改名", palette) { onRevealChange(false); onRename() }
+            ShelfRowAction(Icons.Default.ContentCopy, "复制", palette) { onRevealChange(false); onCopy() }
+            ShelfRowAction(Icons.Default.Share, "分享", palette) { onRevealChange(false); onShare() }
+            ShelfRowAction(Icons.Default.Delete, "移除", palette) { onRevealChange(false); onRemove() }
+        }
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .offset { IntOffset(dragOffset.roundToInt(), 0) }
+                .pointerInput(book.key, revealed) {
+                    detectHorizontalDragGestures(
+                        onDragEnd = {
+                            val open = dragOffset < -actionWidth / 2
+                            dragOffset = if (open) -actionWidth else 0f
+                            onRevealChange(open)
+                        }
+                    ) { _, dragAmount ->
+                        dragOffset = (dragOffset + dragAmount).coerceIn(-actionWidth, 0f)
+                    }
+                }
+                .clickable {
+                    if (revealed) onRevealChange(false) else onOpen()
+                },
+            color = palette.surface,
+            shape = RoundedCornerShape(8.dp),
+            border = BorderStroke(1.dp, palette.border)
+        ) {
+            Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 13.dp)) {
+                Text(
+                    book.title,
+                    color = palette.ink,
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(Modifier.height(5.dp))
+                Text(
+                    "读到：${book.lastChapterTitle.ifBlank { "尚未记录章节" }}",
+                    color = palette.muted,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    book.lastReadUrl,
+                    color = palette.accent,
+                    fontSize = 10.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ShelfRowAction(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    palette: ReaderPalette,
+    onClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .width(42.dp)
+            .fillMaxHeight()
+            .clickable(onClick = onClick),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Icon(icon, contentDescription = label, tint = palette.accent, modifier = Modifier.size(19.dp))
+        Spacer(Modifier.height(3.dp))
+        Text(label, fontSize = 10.sp, color = palette.muted)
+    }
+}
+
+@Composable
+private fun SearchTab(
+    palette: ReaderPalette,
+    query: String,
+    onQueryChange: (String) -> Unit,
+    site: String,
+    onSiteChange: (String) -> Unit,
+    onSearch: (String, String) -> Unit,
+    loading: Boolean,
+    error: String?,
+    results: List<SearchResult>,
+    inShelf: (String) -> Boolean,
+    onOpen: (SearchResult) -> Unit,
+    onSave: (SearchResult) -> Unit
+) {
+    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
+        Text("搜索找书", color = palette.ink, fontSize = 22.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 12.dp))
+        Spacer(Modifier.height(10.dp))
+        OutlinedTextField(
+            value = query,
+            onValueChange = onQueryChange,
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            placeholder = { Text("输入书名，例如 修真聊天群") },
+            shape = RoundedCornerShape(9.dp)
+        )
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = site,
+            onValueChange = onSiteChange,
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            placeholder = { Text("限定站点（可留空搜全网）") },
+            shape = RoundedCornerShape(9.dp)
+        )
+        Spacer(Modifier.height(10.dp))
+        Button(
+            onClick = { onSearch(query, site) },
+            enabled = !loading && query.isNotBlank(),
+            modifier = Modifier.fillMaxWidth().height(46.dp),
+            shape = RoundedCornerShape(9.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF226B59))
+        ) {
+            Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text(if (loading) "搜索中..." else "搜索", fontSize = 14.sp)
+        }
+        error?.let { message ->
+            Spacer(Modifier.height(8.dp))
+            Text(message, color = palette.muted, fontSize = 11.sp)
+        }
+        Spacer(Modifier.height(8.dp))
+        if (results.isEmpty() && !loading && error == null) {
+            Text(
+                "搜索使用系统浏览器内核在后台完成，结果中的书籍可直接保存到书架。",
+                color = palette.muted,
+                fontSize = 11.sp
+            )
+        }
+        LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(vertical = 6.dp)) {
+            items(results, key = { it.href }) { result ->
+                Surface(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp),
+                    color = palette.surface,
+                    shape = RoundedCornerShape(8.dp),
+                    border = BorderStroke(1.dp, palette.border)
+                ) {
+                    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp)) {
+                        Text(result.title, color = palette.ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Spacer(Modifier.height(3.dp))
+                        Text(result.href, color = palette.muted, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Spacer(Modifier.height(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = { onOpen(result) },
+                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF226B59))
+                            ) { Text("打开阅读", fontSize = 12.sp) }
+                            OutlinedButton(
+                                onClick = { onSave(result) },
+                                enabled = !inShelf(result.href),
+                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+                            ) { Text(if (inShelf(result.href)) "已在书架" else "保存到书架", fontSize = 12.sp) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsTab(
+    palette: ReaderPalette,
+    settings: ReaderSettings,
+    onSettingsChange: (ReaderSettings) -> Unit,
+    onCheckForUpdate: () -> Unit,
+    updateChecking: Boolean,
+    updateStatusMessage: String?
+) {
+    Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)) {
+        Text("设置", color = palette.ink, fontSize = 22.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 12.dp, bottom = 6.dp))
+        ReaderSettingsPanel(
+            palette = palette,
+            settings = settings,
+            onSettingsChange = onSettingsChange,
+            onClose = {},
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(14.dp))
+        OutlinedButton(
+            onClick = onCheckForUpdate,
+            enabled = !updateChecking,
+            modifier = Modifier.fillMaxWidth().height(46.dp),
+            shape = RoundedCornerShape(9.dp)
+        ) {
+            Icon(Icons.Default.Refresh, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text(if (updateChecking) "检查中..." else "检查更新", fontSize = 14.sp)
+        }
+        updateStatusMessage?.let { message ->
+            Spacer(Modifier.height(7.dp))
+            Text(message, fontSize = 11.sp, color = palette.muted)
+        }
+        Spacer(Modifier.height(20.dp))
     }
 }
 
