@@ -135,7 +135,12 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-private enum class AppScreen { HOME, READER, BOOKSHELF }
+// Screen routing uses plain constants on purpose. It used to compare AppScreen enum names, and in
+// this build AppScreen.HOME.name evaluated to "BOOKSHELF" at runtime, so the main area never
+// matched and leaving the reader looked broken. Constants cannot be affected by that.
+private const val ScreenHome = 0
+private const val ScreenReader = 1
+private const val ScreenShelf = 2
 
 // Main-area tabs shown in the bottom bar; the reader is a full-screen destination above them.
 private enum class HomeTab { SHELF, SEARCH, SETTINGS }
@@ -501,22 +506,45 @@ private val NightPalette = ReaderPalette(
 
 class MainActivity : ComponentActivity() {
     private val sharedUrlState = mutableStateOf("")
+    // A shared link is delivered once per process. The SEND intent stays on the activity after the
+    // reader is left, so without this marker the app jumped straight back into the shared page and
+    // 返回书架 / 返回 looked broken.
+    private val sharedDeliveryState = mutableStateOf(0)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestedOrientation = loadScreenOrientation(getSharedPreferences("jingdu", 0)).toRequestedOrientation()
-        sharedUrlState.value = extractSharedUrl(intent)
-        setContent { JingduApp(initialUrl = sharedUrlState.value) }
+        applySharedIntent(intent)
+        setContent {
+            JingduApp(
+                sharedUrl = sharedUrlState.value,
+                sharedDelivery = sharedDeliveryState.value
+            )
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        sharedUrlState.value = extractSharedUrl(intent)
+        applySharedIntent(intent)
+    }
+
+    private fun applySharedIntent(intent: Intent?) {
+        val shared = extractSharedUrl(intent)
+        sharedUrlState.value = shared
+        if (shared.isNotBlank() && shared != alreadyDeliveredSharedUrl) {
+            alreadyDeliveredSharedUrl = shared
+            sharedDeliveryState.value += 1
+        }
+    }
+
+    private companion object {
+        var alreadyDeliveredSharedUrl: String = ""
     }
 }
 
 @Composable
-private fun JingduApp(initialUrl: String = "") {
+private fun JingduApp(sharedUrl: String = "", sharedDelivery: Int = 0) {
+    val initialUrl = if (sharedDelivery > 0) sharedUrl else ""
     val context = androidx.compose.ui.platform.LocalContext.current
     val activity = context as? ComponentActivity
     val preferences = remember { context.getSharedPreferences("jingdu", 0) }
@@ -525,7 +553,7 @@ private fun JingduApp(initialUrl: String = "") {
     var screen by rememberSaveable {
         // Start on the tabbed main area; a saved book only continues reading when opened explicitly
         // or when the app is launched from a shared link.
-        mutableStateOf(if (initialUrl.isNotBlank()) AppScreen.READER.name else AppScreen.HOME.name)
+        mutableStateOf(if (initialUrl.isNotBlank()) ScreenReader else ScreenHome)
     }
     var homeTab by rememberSaveable { mutableStateOf(HomeTab.SHELF.name) }
     var searchWebView by remember { mutableStateOf<WebView?>(null) }
@@ -560,15 +588,16 @@ private fun JingduApp(initialUrl: String = "") {
         }
     }
 
-    // A shared link must actually open, not just fill the address bar. The first plain assignment
-    // only mirrors it into the field; the request itself is consumed further down, once the loader
-    // exists, through this one-shot holder.
+    // A shared link must actually open, not just fill the address bar, and only on the launch that
+    // carried it. Re-delivering it after the reader was closed is what made 返回书架 / 返回 look
+    // broken, because the reader came straight back.
     var pendingSharedUrl by remember { mutableStateOf(initialUrl) }
-    LaunchedEffect(initialUrl) {
-        if (initialUrl.isNotBlank()) {
-            address = initialUrl
-            pendingSharedUrl = initialUrl
-        }
+    var handledSharedDelivery by rememberSaveable { mutableStateOf(0) }
+    LaunchedEffect(sharedDelivery) {
+        if (sharedDelivery <= 0 || sharedDelivery == handledSharedDelivery) return@LaunchedEffect
+        handledSharedDelivery = sharedDelivery
+        address = sharedUrl
+        pendingSharedUrl = sharedUrl
     }
     var document by remember { mutableStateOf(restoredDocument) }
     var visibleDocumentForPersistence by remember { mutableStateOf(restoredDocument) }
@@ -738,16 +767,16 @@ private fun JingduApp(initialUrl: String = "") {
     SideEffect {
         val window = activity?.window
         if (window != null) {
-            val palette = if (screen == AppScreen.READER.name) paletteFor(settings.theme) else IvoryPalette
-            val horizontalReader = screen == AppScreen.READER.name && settings.pageMode == PageMode.HORIZONTAL
+            val palette = if (screen == ScreenReader) paletteFor(settings.theme) else IvoryPalette
+            val horizontalReader = screen == ScreenReader && settings.pageMode == PageMode.HORIZONTAL
             window.statusBarColor = palette.background.toArgb()
             window.navigationBarColor = if (horizontalReader) AndroidColor.TRANSPARENT else palette.background.toArgb()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 window.isNavigationBarContrastEnforced = !horizontalReader
             }
             WindowInsetsControllerCompat(window, window.decorView).apply {
-                isAppearanceLightStatusBars = screen != AppScreen.READER.name || settings.theme != ReaderTheme.NIGHT
-                isAppearanceLightNavigationBars = screen != AppScreen.READER.name || settings.theme != ReaderTheme.NIGHT
+                isAppearanceLightStatusBars = screen != ScreenReader || settings.theme != ReaderTheme.NIGHT
+                isAppearanceLightNavigationBars = screen != ScreenReader || settings.theme != ReaderTheme.NIGHT
             }
         }
     }
@@ -1657,7 +1686,7 @@ private fun JingduApp(initialUrl: String = "") {
         }
         pendingAutoNext = false
         preferences.edit().putString("last_url", normalized).apply()
-        screen = AppScreen.READER.name
+        screen = ScreenReader
         if (catalogContext != null) activeCatalogUrl = catalogContext
         activeCatalogIndex = catalogIndexOverride
         if (forceReload) {
@@ -1780,12 +1809,11 @@ private fun JingduApp(initialUrl: String = "") {
     LaunchedEffect(pendingSharedUrl, document?.sourceUrl, loading) {
         val shared = pendingSharedUrl
         if (shared.isBlank()) return@LaunchedEffect
-        if (loading && document == null) return@LaunchedEffect
+        if (loading) return@LaunchedEffect
         if (document != null && sameUrl(document?.sourceUrl.orEmpty(), shared)) {
             pendingSharedUrl = ""
             return@LaunchedEffect
         }
-        if (loading) return@LaunchedEffect
         pendingSharedUrl = ""
         recordDiagnostic("open_shared_url", shared, "from_intent")
         openUrl(shared)
@@ -2000,7 +2028,7 @@ private fun JingduApp(initialUrl: String = "") {
     }
 
     fun handleActiveError(view: WebView, requestToken: Long, pageUrl: String, reason: String) {
-        if (screen == AppScreen.READER.name &&
+        if (screen == ScreenReader &&
             view === activeWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
             activeLoadUrl.isNotEmpty() && sameReaderLoadUrl(pageUrl, activeLoadUrl)) {
             if (isCloudflareChallengeReason(reason)) {
@@ -2050,7 +2078,7 @@ private fun JingduApp(initialUrl: String = "") {
         var accepted = false
         val expected = activeLoadUrl
         val result = parseReaderPayload(rawPayload)
-        val tokenMatches = screen == AppScreen.READER.name &&
+        val tokenMatches = screen == ScreenReader &&
             view === activeWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
         val matches = expected.isNotEmpty() && tokenMatches &&
             (sameReaderLoadUrl(pageUrl, expected) || (result != null && sameReaderLoadUrl(result.sourceUrl, expected)))
@@ -2085,7 +2113,7 @@ private fun JingduApp(initialUrl: String = "") {
         var accepted = false
         val expected = prefetchLoadUrl
         val result = parseReaderPayload(rawPayload)
-        val tokenMatches = screen == AppScreen.READER.name &&
+        val tokenMatches = screen == ScreenReader &&
             view === prefetchWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
         val matches = expected.isNotEmpty() && tokenMatches &&
             (sameReaderLoadUrl(pageUrl, expected) || (result != null && sameReaderLoadUrl(result.sourceUrl, expected)))
@@ -2101,7 +2129,7 @@ private fun JingduApp(initialUrl: String = "") {
         accepted
     }
     val prefetchErrorState = rememberUpdatedState<(WebView, Long, String, String) -> Unit> { view, requestToken, pageUrl, reason ->
-        if (screen == AppScreen.READER.name &&
+        if (screen == ScreenReader &&
             view === prefetchWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
             prefetchLoadUrl.isNotEmpty() && sameReaderLoadUrl(pageUrl, prefetchLoadUrl)) {
             val failedUrl = prefetchLoadUrl
@@ -2151,7 +2179,7 @@ private fun JingduApp(initialUrl: String = "") {
         var accepted = false
         val expected = previousLoadUrl
         val result = parseReaderPayload(rawPayload)
-        val tokenMatches = screen == AppScreen.READER.name &&
+        val tokenMatches = screen == ScreenReader &&
             view === previousWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
         val matches = expected.isNotEmpty() && tokenMatches &&
             (sameReaderLoadUrl(pageUrl, expected) || (result != null && sameReaderLoadUrl(result.sourceUrl, expected)))
@@ -2193,7 +2221,7 @@ private fun JingduApp(initialUrl: String = "") {
         accepted
     }
     val previousErrorState = rememberUpdatedState<(WebView, Long, String, String) -> Unit> { view, requestToken, pageUrl, reason ->
-        if (screen == AppScreen.READER.name &&
+        if (screen == ScreenReader &&
             view === previousWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
             previousLoadUrl.isNotEmpty() && sameReaderLoadUrl(pageUrl, previousLoadUrl)) {
             val failedUrl = previousPageBaseUrl.takeIf { it.isNotEmpty() } ?: previousLoadUrl
@@ -2214,7 +2242,7 @@ private fun JingduApp(initialUrl: String = "") {
     val catalogPayloadState = rememberUpdatedState<(WebView, Long, String, String) -> Boolean> { view, requestToken, pageUrl, rawPayload ->
         val expected = catalogLoadUrl
         val result = parseReaderPayload(rawPayload)
-        val tokenMatches = screen == AppScreen.READER.name &&
+        val tokenMatches = screen == ScreenReader &&
             view === catalogWebView && requestToken != 0L && requestToken == webViewLoadToken(view)
         val matches = expected.isNotEmpty() && tokenMatches &&
             (sameReaderLoadUrl(pageUrl, expected) || (result != null && sameReaderLoadUrl(result.sourceUrl, expected)))
@@ -2227,7 +2255,7 @@ private fun JingduApp(initialUrl: String = "") {
         }
     }
     val catalogErrorState = rememberUpdatedState<(WebView, Long, String, String) -> Unit> { view, requestToken, pageUrl, reason ->
-        if (screen == AppScreen.READER.name &&
+        if (screen == ScreenReader &&
             view === catalogWebView && requestToken != 0L && requestToken == webViewLoadToken(view) &&
             catalogLoadUrl.isNotEmpty() && sameReaderLoadUrl(pageUrl, catalogLoadUrl)) {
             recordDiagnostic(
@@ -2264,7 +2292,7 @@ private fun JingduApp(initialUrl: String = "") {
             .apply()
     }
     LaunchedEffect(screen, document, activeLoadUrl) {
-        if (screen != AppScreen.READER.name) {
+        if (screen != ScreenReader) {
             cancelReaderChapterLoads()
             return@LaunchedEffect
         }
@@ -2505,7 +2533,7 @@ private fun JingduApp(initialUrl: String = "") {
     )
 
     JingduTheme(settings.theme) {
-        val windowBackground = if (screen == AppScreen.READER.name) {
+        val windowBackground = if (screen == ScreenReader) {
             paletteFor(settings.theme).background
         } else {
             IvoryPalette.background
@@ -2513,7 +2541,7 @@ private fun JingduApp(initialUrl: String = "") {
         Box(modifier = Modifier.fillMaxSize().background(windowBackground)) {
             key(activeWebViewGeneration) {
                 AndroidView(
-                    modifier = if (screen == AppScreen.READER.name && cloudflareChallengeWebView === activeWebView) {
+                    modifier = if (screen == ScreenReader && cloudflareChallengeWebView === activeWebView) {
                         Modifier.fillMaxSize().zIndex(10f)
                     } else {
                         Modifier.size(1.dp).alpha(0f)
@@ -2532,7 +2560,7 @@ private fun JingduApp(initialUrl: String = "") {
             }
             key(prefetchWebViewGeneration) {
                 AndroidView(
-                    modifier = if (screen == AppScreen.READER.name &&
+                    modifier = if (screen == ScreenReader &&
                         cloudflareChallengeWebView === prefetchWebView &&
                         (pendingAutoNext || pendingChapterNavigation != null)
                     ) {
@@ -2554,7 +2582,7 @@ private fun JingduApp(initialUrl: String = "") {
             }
             key(previousWebViewGeneration) {
                 AndroidView(
-                    modifier = if (screen == AppScreen.READER.name &&
+                    modifier = if (screen == ScreenReader &&
                         cloudflareChallengeWebView === previousWebView &&
                         pendingChapterNavigation != null
                     ) {
@@ -2576,7 +2604,7 @@ private fun JingduApp(initialUrl: String = "") {
             }
             key(catalogWebViewGeneration) {
                 AndroidView(
-                    modifier = if (screen == AppScreen.READER.name &&
+                    modifier = if (screen == ScreenReader &&
                         cloudflareChallengeWebView === catalogWebView &&
                         catalogLoadUrl.isNotEmpty()
                     ) {
@@ -2640,7 +2668,10 @@ private fun JingduApp(initialUrl: String = "") {
                 )
             }
 
-            if (screen == AppScreen.HOME.name) {
+            // Anything that is not the reader is the tabbed main area. This used to check for the
+            // HOME value only, so leaving the reader (which sets the shelf value) fell through to
+            // the reader branch and the app looked stuck on the chapter.
+            if (screen != ScreenReader) {
                 HomeScaffold(
                     palette = paletteFor(settings.theme),
                     activeTab = homeTab,
@@ -2741,7 +2772,12 @@ private fun JingduApp(initialUrl: String = "") {
                     saveCurrentDocumentCache(commit = true)
                     saveLatestReadingPosition(commit = true)
                     cancelReaderChapterLoads()
-                    screen = if (currentBookInShelf) AppScreen.BOOKSHELF.name else AppScreen.HOME.name
+                    recordDiagnostic(
+                        "exit_reader",
+                        document?.sourceUrl.orEmpty(),
+                        "via=back inShelf=$currentBookInShelf"
+                    )
+                    screen = if (currentBookInShelf) ScreenShelf else ScreenHome
                 }
                 ReaderScreen(
                     document = document,
@@ -2841,7 +2877,7 @@ private fun JingduApp(initialUrl: String = "") {
                         }
                         saveLatestReadingPosition(commit = true)
                         cancelReaderChapterLoads()
-                        screen = if (currentBookInShelf) AppScreen.BOOKSHELF.name else AppScreen.HOME.name
+                        screen = if (currentBookInShelf) ScreenShelf else ScreenHome
                         loading = false
                     },
                     onReload = { openUrl(currentUrl, forceReload = true) },
