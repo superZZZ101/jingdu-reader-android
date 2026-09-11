@@ -940,6 +940,14 @@ private fun JingduApp(initialUrl: String = "") {
     fun previousChapterLink(result: ReaderDocument): ReaderLink? =
         resolveReaderNavigationLinks(result, navigationCatalogFor(result)).previous
 
+    // Whether a real previous chapter exists, independent of whether it is already cached: the
+    // menu button must stay usable right after the catalog resolves instead of waiting for a load.
+    fun hasPreviousChapter(result: ReaderDocument): Boolean {
+        val catalog = navigationCatalogFor(result)
+        val link = resolveReaderNavigationLinks(result, catalog).previous ?: return false
+        return link.href.isNotBlank() && !sameUrl(link.href, result.sourceUrl)
+    }
+
     fun prepareNext(result: ReaderDocument) {
         if (result.isCatalog) {
             setPrefetchTarget("", "")
@@ -2122,10 +2130,11 @@ private fun JingduApp(initialUrl: String = "") {
                 )
             } else {
                 val baseCatalogUrl = document?.navigation?.catalog?.href?.let(::normalizeUrl).orEmpty()
-                val cachedCatalog = activeCatalogUrl.takeIf { it.isNotEmpty() }?.let(::findCached)
+                val cachedCatalog = document?.let { current -> navigationCatalogFor(current) }
                 val navigationLinks = document?.let { current ->
                     resolveReaderNavigationLinks(current, cachedCatalog)
                 } ?: ReaderNavigationLinks(catalog = document?.navigation?.catalog)
+                val previousChapterAvailable = document?.let { current -> hasPreviousChapter(current) } == true
                 val currentSourceUrl = document?.sourceUrl.orEmpty()
                 val previousChapter = navigationLinks.previous?.href
                     ?.let(::normalizeUrl)
@@ -2176,6 +2185,7 @@ private fun JingduApp(initialUrl: String = "") {
                     nextChapter = nextChapter,
                     nextChapterReady = nextChapterReady,
                     navigationLinks = navigationLinks,
+                    previousChapterAvailable = previousChapterAvailable,
                     catalogDocument = cachedCatalog,
                     catalogIndex = activeCatalogIndex,
                     catalogLoading = catalogLoadUrl.isNotEmpty(),
@@ -2859,6 +2869,7 @@ private fun ReaderScreen(
     nextChapter: ReaderDocument?,
     nextChapterReady: Boolean,
     navigationLinks: ReaderNavigationLinks,
+    previousChapterAvailable: Boolean,
     catalogDocument: ReaderDocument?,
     catalogIndex: Int?,
     catalogLoading: Boolean,
@@ -2967,6 +2978,8 @@ private fun ReaderScreen(
                         onOpenNextChapter()
                     },
                     nextChapterAvailable = navigationLinks.next != null,
+                    previousChapterAvailable = previousChapterAvailable,
+                    onCopyDiagnosticLog = onCopyDiagnosticLog,
                     onOpenCatalog = {
                         onOpenCatalog()
                         menuVisible = false
@@ -3027,6 +3040,8 @@ private fun ReaderMenu(
     onOpenCatalog: () -> Unit,
     onNextChapter: () -> Unit,
     nextChapterAvailable: Boolean,
+    previousChapterAvailable: Boolean,
+    onCopyDiagnosticLog: () -> Unit,
     onAddToBookshelf: () -> Unit,
     onOpenSettings: () -> Unit,
     onExitReading: () -> Unit,
@@ -3050,7 +3065,7 @@ private fun ReaderMenu(
             MenuAction(
                 icon = Icons.Default.ArrowBack,
                 label = "上一章",
-                enabled = document?.navigation?.previous != null,
+                enabled = previousChapterAvailable,
                 palette = palette,
                 onClick = onPreviousChapter
             )
@@ -3090,6 +3105,13 @@ private fun ReaderMenu(
                 enabled = true,
                 palette = palette,
                 onClick = onOpenSettings
+            )
+            MenuAction(
+                icon = Icons.Default.Refresh,
+                label = "诊断",
+                enabled = true,
+                palette = palette,
+                onClick = onCopyDiagnosticLog
             )
             IconButton(onClick = onClose) {
                 Icon(Icons.Default.Close, contentDescription = "关闭菜单", tint = palette.muted)
