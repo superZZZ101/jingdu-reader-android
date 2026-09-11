@@ -1,7 +1,8 @@
 ﻿param(
   [Parameter(Mandatory = $true)][string]$Label,
   [int]$WaitSeconds = 8,
-  [switch]$DumpTexts
+  [switch]$DumpTexts,
+  [string]$Device = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -10,8 +11,8 @@ $package = 'com.example.jingdu'
 $work = 'C:\Users\mingy\Documents\ds_harness\novel-reading-android\.device-check'
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
-& $adb shell uiautomator dump /sdcard/ui-tap.xml | Out-Null
-& $adb exec-out cat /sdcard/ui-tap.xml > "$work\ui-tap.xml"
+& $adb -s $Device shell uiautomator dump /sdcard/ui-tap.xml | Out-Null
+& $adb -s $Device exec-out cat /sdcard/ui-tap.xml > "$work\ui-tap.xml"
 $ui = [System.IO.File]::ReadAllText("$work\ui-tap.xml", [System.Text.Encoding]::UTF8)
 
 $pattern = 'text="' + [regex]::Escape($Label) + '"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"'
@@ -22,20 +23,20 @@ if (-not $match.Success) {
 }
 $x = [int](([int]$match.Groups[1].Value + [int]$match.Groups[3].Value) / 2)
 $y = [int](([int]$match.Groups[2].Value + [int]$match.Groups[4].Value) / 2)
-& $adb shell input tap $x $y | Out-Null
+& $adb -s $Device shell input tap $x $y | Out-Null
 Write-Output ("tapped " + $Label + " at " + $x + "," + $y)
 
 Start-Sleep -Seconds $WaitSeconds
 
 if ($DumpTexts) {
-  & $adb shell uiautomator dump /sdcard/ui-after.xml | Out-Null
-  & $adb exec-out cat /sdcard/ui-after.xml > "$work\ui-after.xml"
+  & $adb -s $Device shell uiautomator dump /sdcard/ui-after.xml | Out-Null
+  & $adb -s $Device exec-out cat /sdcard/ui-after.xml > "$work\ui-after.xml"
   $after = [System.IO.File]::ReadAllText("$work\ui-after.xml", [System.Text.Encoding]::UTF8)
   Write-Output '--- screen texts ---'
   [regex]::Matches($after, 'text="([^"]+)"') | ForEach-Object { $_.Groups[1].Value } | Select-Object -First 40 | ForEach-Object { Write-Output $_ }
 }
 
-& $adb exec-out run-as $package cat /data/data/$package/shared_prefs/jingdu.xml > "$work\prefs-after.xml" 2>$null
+& $adb -s $Device exec-out run-as $package cat /data/data/$package/shared_prefs/jingdu.xml > "$work\prefs-after.xml" 2>$null
 $prefs = [System.IO.File]::ReadAllText("$work\prefs-after.xml", [System.Text.Encoding]::UTF8)
 function Get-PrefValue([string]$name) {
   $p = '<string name="' + [regex]::Escape($name) + '">(.*?)</string>'

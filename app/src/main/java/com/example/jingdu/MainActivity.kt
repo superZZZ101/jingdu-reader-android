@@ -146,6 +146,29 @@ private const val CATALOG_STATE_ERROR_KEY = "catalog_state_error"
 private const val DIAGNOSTIC_LOG_KEY = "diagnostic_log"
 private const val MAX_DIAGNOSTIC_LOGS = 150
 
+// Chapter sites that split one chapter across several pages often mark the split with a sentence
+// like "（本章未完，请点击下一页继续阅读）" and hide the page links on mobile layouts.
+private val ContinuationHintRegex = Regex("(本章未完|请点击下一页|下一页继续阅读|未完待续|to be continued)", RegexOption.IGNORE_CASE)
+private val ContinuationSuffixes = listOf("_2.html", "_2.htm", "_2", "-2.html", "-2", "2.html")
+
+private fun pageCandidatesFor(url: String): List<String> {
+    val clean = url.substringBefore('#')
+    val dot = clean.lastIndexOf('.')
+    val slash = clean.lastIndexOf('/')
+    val hasExtension = dot > slash && clean.length - dot <= 5
+    val base = if (hasExtension) clean.substring(0, dot) else clean
+    val extension = if (hasExtension) clean.substring(dot) else ""
+    return ContinuationSuffixes
+        .map { suffix ->
+            // "_2.html" style suffixes keep the original extension; bare "2.html" replaces it.
+            if (suffix.endsWith(extension) && extension.isNotEmpty()) base + suffix
+            else if (suffix.contains('.')) base + extension + suffix
+            else base + suffix
+        }
+        .distinct()
+        .filter { it != clean }
+}
+
 // How many chapters past the current one stay warm: the reader can be reading one chapter while
 // the next two are already cached, which keeps the boundary transition instant.
 private const val MaxPrefetchChapterDepth = 2
@@ -792,6 +815,18 @@ private fun JingduApp(initialUrl: String = "") {
         }
     }
 
+    // True when the chapter's own text announces that another page exists.
+    fun chapterTextAnnouncesContinuation(document: ReaderDocument): Boolean =
+        document.paragraphs.takeLast(3).any { ContinuationHintRegex.containsMatchIn(it) }
+
+    // The split marker survives even when the site hides or strips its page links, so try the
+    // usual continuation names for those chapters.
+    fun continuationCandidates(document: ReaderDocument): List<String> =
+        pageCandidatesFor(document.sourceUrl).filter { candidate ->
+            val cached = findCached(candidate)
+            cached == null || cached.paragraphs.isEmpty() || cached.isCatalog
+        }
+
     fun hasUncachedPageContinuation(start: ReaderDocument): Boolean =
         uncachedPageContinuationUrl(start) != null
 
@@ -981,6 +1016,12 @@ private fun JingduApp(initialUrl: String = "") {
         val currentContinuation = uncachedPageContinuationUrl(result)
         if (currentContinuation != null && !sameUrl(currentContinuation, result.sourceUrl)) {
             return cacheKey(result.sourceUrl) to currentContinuation
+        }
+        // No page link found: split chapters usually still announce their own continuation.
+        if (chapterTextAnnouncesContinuation(result)) {
+            continuationCandidates(result).firstOrNull()?.let { candidate ->
+                return cacheKey(result.sourceUrl) to candidate
+            }
         }
         val next = nextChapterLink(result)?.href?.let(::normalizeUrl).orEmpty()
         if (next.isEmpty() || sameUrl(next, result.sourceUrl)) return "" to ""
@@ -1219,11 +1260,10 @@ private fun JingduApp(initialUrl: String = "") {
     fun mergeCachedPageChain(startUrl: String): ReaderDocument? {
         val base = startUrl.takeIf { it.isNotEmpty() }?.let(::findCached) ?: return null
         if (base.isCatalog || base.paragraphs.isEmpty()) return null
-        val merged = mergeCachedContinuation(base)
-        if (!sameUrl(merged.sourceUrl, base.sourceUrl)) return merged
-        // Absorb the current chapter's own text continuation pages when they are already cached.
-        var current = merged
+        var current = mergeCachedContinuation(base)
         val seen = mutableSetOf(cacheKey(current.sourceUrl))
+        // Absorb this chapter's own text continuation pages ("下一页" pages) when cached; skipping
+        // this leaves the reader with only the first half of a split chapter.
         while (true) {
             val continuationUrl = current.navigation.nextPage?.href?.let(::normalizeUrl).orEmpty()
             val continuationKey = cacheKey(continuationUrl)
@@ -1236,6 +1276,26 @@ private fun JingduApp(initialUrl: String = "") {
         }
         cacheDocument(current, startUrl)
         return current
+    }
+
+    // A chapter split across several pages must be shown whole: absorb every cached continuation
+    // page of the chapter that is currently open, and surface the merged document immediately.
+    fun prewarmActiveChapter(current: ReaderDocument) {
+        if (current.isCatalog) return
+        val merged = mergeCachedPageChain(current.sourceUrl) ?: return
+        val absorbed = merged.paragraphs.size > current.paragraphs.size
+        val mergedUrl = cacheKey(merged.sourceUrl)
+        val currentUrl = cacheKey(current.sourceUrl)
+        if (absorbed && mergedUrl == currentUrl) {
+            document = merged
+            visibleDocumentForPersistence = merged
+            windowRevision += 1
+            recordDiagnostic(
+                "chapter_merged",
+                current.sourceUrl,
+                "before=${current.paragraphs.size} after=${merged.paragraphs.size}"
+            )
+        }
     }
 
     fun prewarmReadingWindow(current: ReaderDocument) {
@@ -1309,9 +1369,18 @@ private fun JingduApp(initialUrl: String = "") {
         // Assemble the reading window from what is already cached, so the chapters beside the
         // current one are ready to render before any background download finishes.
         prewarmReadingWindow(displayResult)
+        prewarmActiveChapter(displayResult)
         preparePrevious(displayResult)
         prepareNext(displayResult)
         if (displayResult.isCatalog) startCatalogCrawl(displayResult.sourceUrl, displayResult)
+    }
+
+    // Opening a chapter from the local cache skips showDocument, so absorb its continuation pages
+    // here as well; this keeps split chapters whole no matter how the chapter was reached.
+    LaunchedEffect(document?.sourceUrl, document?.isCatalog) {
+        document?.takeUnless { it.isCatalog }?.let { current ->
+            prewarmActiveChapter(current)
+        }
     }
 
     fun openUrl(
@@ -3466,6 +3535,40 @@ private fun CatalogDrawer(
                         Icon(Icons.Default.Close, contentDescription = "关闭目录", tint = palette.muted)
                     }
                 }
+                if (catalogDocument != null && catalogDocument.catalogItems.isNotEmpty()) {
+                    var jumpInput by remember(catalogDocument.sourceUrl) { mutableStateOf("") }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 17.dp, end = 12.dp, bottom = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedTextField(
+                            value = jumpInput,
+                            onValueChange = { value -> jumpInput = value.filter { it.isDigit() }.take(5) },
+                            modifier = Modifier.weight(1f),
+                            singleLine = true,
+                            textStyle = LocalTextStyle.current.copy(fontSize = 13.sp),
+                            placeholder = { Text("输入章节序号，如 120", fontSize = 12.sp) }
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Button(
+                            onClick = {
+                                val requested = jumpInput.toIntOrNull()
+                                val target = requested?.let { chapterItemForNumber(catalogDocument.catalogItems, it) }
+                                target?.let { item ->
+                                    val index = catalogDocument.catalogItems.indexOf(item)
+                                    onNavigate(item.href, index)
+                                    onClose()
+                                }
+                            },
+                            enabled = jumpInput.isNotEmpty(),
+                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+                        ) {
+                            Text("跳转", fontSize = 13.sp)
+                        }
+                    }
+                }
                 when {
                     catalogDocument != null -> LazyColumn(
                         state = listState,
@@ -4992,6 +5095,44 @@ private fun chapterNumber(value: String): String? {
     val match = Regex("(?:第\\s*([0-9一二三四五六七八九十百千万]+)\\s*[章回节卷集篇]|chapter\\s*([0-9]+))", RegexOption.IGNORE_CASE)
         .find(value)
     return match?.groupValues?.drop(1)?.firstOrNull { it.isNotEmpty() }
+}
+
+private fun chineseNumeralToInt(value: String): Int? {
+    if (value.isEmpty()) return null
+    val digits = mapOf('零' to 0, '一' to 1, '二' to 2, '两' to 2, '三' to 3, '四' to 4, '五' to 5, '六' to 6, '七' to 7, '八' to 8, '九' to 9)
+    val units = mapOf('十' to 10, '百' to 100, '千' to 1000, '万' to 10000)
+    var total = 0
+    var section = 0
+    var number = 0
+    for (character in value) {
+        val digit = digits[character]
+        when {
+            digit != null -> number = digit
+            character in units -> {
+                val unit = units.getValue(character)
+                section += (if (number == 0) 1 else number) * unit
+                number = 0
+            }
+            else -> return null
+        }
+    }
+    total += section + number
+    return total.takeIf { it > 0 }
+}
+
+// Jump target for "跳到第 N 章": prefer the chapter number printed in the label, and fall back to
+// the entry's position so catalogs without numbered labels still support jumping.
+private fun chapterItemForNumber(items: List<ReaderLink>, requested: Int): ReaderLink? {
+    if (items.isEmpty() || requested <= 0) return null
+    val parsed = items.map { item ->
+        val raw = chapterNumber(item.label)
+        val parsedNumber = raw?.let { text -> text.toIntOrNull() ?: chineseNumeralToInt(text) }
+        if (parsedNumber != null) item to parsedNumber else null
+    }
+    if (parsed.any { it != null }) {
+        return parsed.firstOrNull { it?.second == requested }?.first
+    }
+    return items.getOrNull(requested - 1)
 }
 
 private fun catalogNumberLabel(label: String): String = chapterNumber(label)?.let { "第${it}章" } ?: "章节"

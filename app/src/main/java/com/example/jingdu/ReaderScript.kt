@@ -57,6 +57,34 @@ object ReaderScript {
             }
             return anchors;
           }
+          // Mobile layouts commonly hide the text-pagination bar with display:none while the pages
+          // themselves still exist; expose those blocks for link discovery, then restore them.
+          function revealHiddenNavigation() {
+            const elements = [...document.querySelectorAll('div,section,ul,ol,p,span')];
+            const restored = [];
+            for (const element of elements) {
+              if (element.closest('#rm-root')) continue;
+              let display = '';
+              try { display = getComputedStyle(element).display; } catch (_) { display = ''; }
+              if (display !== 'none') continue;
+              const text = clean(element.textContent || '');
+              if (!/(上一页|下一页|上一章|下一章|章节列表|目录)/.test(text)) continue;
+              if (text.length > 200) continue;
+              restored.push({ element, style: element.getAttribute('style') });
+              element.style.setProperty('display', 'block', 'important');
+            }
+            return restored;
+          }
+          function hideNavigation(element, restored) {
+            for (const entry of restored) {
+              element.querySelectorAll('div,section,ul,ol,p,span').forEach((node) => {
+                const match = restored.find((item) => item.element === node);
+                if (!match) return;
+                if (match.style == null) node.removeAttribute('style');
+                else node.setAttribute('style', match.style);
+              });
+            }
+          }
           function tagIdHint(element) {
             return ((element.id || '') + ' ' + (typeof element.className === 'string' ? element.className : '')).trim();
           }
@@ -329,6 +357,7 @@ object ReaderScript {
             return JSON.stringify({ sourceUrl: location.href, title: '网页无法打开', paragraphs: [], catalogItems: [], catalogPages: [], navigation: findNavigation() });
           }
           const candidate = findCandidate();
+          const restoredNavigation = revealHiddenNavigation();
           const catalogItems = findCatalogItems();
           const heading = headingFor(candidate);
           const headingLooksChapter = heading !== '' && CHAPTER_WORD.test(heading);
@@ -336,7 +365,9 @@ object ReaderScript {
           // Paginated catalogs (numbered pages, "next page" links, page <select>) feed the catalog
           // crawler; chapter-page text continuations stay in navigation.nextPage instead.
           const catalogPages = findCatalogPages();
+          const navigation = findNavigation();
           const title = isCatalog ? titleForCatalog() : (heading || clean(document.title) || '未识别标题');
+          hideNavigation(document, restoredNavigation);
           const clone = candidate.cloneNode(true);
           const originalNodes = [candidate, ...candidate.querySelectorAll('*')];
           const cloneNodes = [clone, ...clone.querySelectorAll('*')];
@@ -346,7 +377,7 @@ object ReaderScript {
           const titleKey = clean(title).replace(/\s/g, '');
           const duplicate = paragraphs.findIndex((item, index) => index < 3 && clean(item).replace(/\s/g, '') === titleKey);
           if (duplicate >= 0) paragraphs.splice(duplicate, 1);
-          return JSON.stringify({ sourceUrl: location.href, title, paragraphs: isCatalog ? [] : paragraphs, catalogItems: isCatalog ? catalogItems : [], catalogPages: isCatalog ? catalogPages : [], navigation: findNavigation() });
+          return JSON.stringify({ sourceUrl: location.href, title, paragraphs: isCatalog ? [] : paragraphs, catalogItems: isCatalog ? catalogItems : [], catalogPages: isCatalog ? catalogPages : [], navigation });
         })()
     """.trimIndent()
 }
