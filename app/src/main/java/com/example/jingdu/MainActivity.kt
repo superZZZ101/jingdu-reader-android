@@ -632,6 +632,9 @@ private fun JingduApp(initialUrl: String = "") {
     }
     var activeCatalogIndex by remember { mutableStateOf<Int?>(null) }
     var catalogNavigationRevision by remember { mutableStateOf(0) }
+    // Bumped whenever the prewarm step materializes neighbour chapters, so the reading window
+    // picks them up immediately instead of on some later recomposition.
+    var windowRevision by remember { mutableStateOf(0) }
     var persistedCatalogDocument by remember { mutableStateOf(restoredCatalogDocument) }
     var chapterOpenPosition by remember { mutableStateOf<ChapterOpenPosition?>(null) }
     var verticalOpenIndex by remember { mutableStateOf<Int?>(null) }
@@ -987,6 +990,11 @@ private fun JingduApp(initialUrl: String = "") {
             return cacheKey(cachedNext.sourceUrl) to nextContinuation
         }
         val nextReady = cachedNext != null && cachedNext.isUsableForReading()
+        // The active chapter's own remaining text pages must land first so the chapter can be read
+        // to its end (and so the next chapter's window entry is complete) before moving on.
+        if (currentContinuation != null && !sameUrl(currentContinuation, result.sourceUrl)) {
+            return cacheKey(result.sourceUrl) to currentContinuation
+        }
         // Guard against downloading the same chapter twice in one session even if the in-memory
         // cache entry was pruned between the download and this check.
         if (nextReady || cacheKey(next) in prefetchCompletedKeys) return "" to ""
@@ -1020,7 +1028,7 @@ private fun JingduApp(initialUrl: String = "") {
         previousLoadUrl = if (previous.isNotEmpty() && !previousReady && !sameUrl(previous, result.sourceUrl)) previous else ""
     }
 
-    LaunchedEffect(document?.sourceUrl, document?.isCatalog, catalogNavigationRevision) {
+    LaunchedEffect(document?.sourceUrl, document?.isCatalog, catalogNavigationRevision, windowRevision) {
         document?.takeUnless { it.isCatalog }?.let { restored ->
             val resolved = resolveReaderNavigationLinks(restored, navigationCatalogFor(restored))
             if (catalogNavigationRevision > 0) {
@@ -1240,6 +1248,7 @@ private fun JingduApp(initialUrl: String = "") {
             if (mergeCachedPageChain(url) != null) materialized += 1
         }
         if (materialized > 0) {
+            windowRevision += 1
             recordDiagnostic(
                 "prewarm_window",
                 current.sourceUrl,
@@ -1717,6 +1726,7 @@ private fun JingduApp(initialUrl: String = "") {
             prefetchRetryCount = 0
             prefetchRetryScheduled = false
             handlePrefetchedChapter(result, expected)
+            windowRevision += 1
             accepted = true
         }
         accepted
@@ -2218,7 +2228,10 @@ private fun JingduApp(initialUrl: String = "") {
                 } ?: ReaderNavigationLinks(catalog = document?.navigation?.catalog)
                 val previousChapterAvailable = document?.let { current -> hasPreviousChapter(current) } == true
                 val currentSourceUrl = document?.sourceUrl.orEmpty()
-                val previousChapter = navigationLinks.previous?.href
+                // Keep the window in sync with neighbour arrivals: the revision read below makes the
+                // chapter lookups recompute as soon as a background load added one.
+                val windowLinks = windowRevision.let { navigationLinks }
+                val previousChapter = windowLinks.previous?.href
                     ?.let(::normalizeUrl)
                     ?.let(::findCached)
                     ?.let(::mergeCachedContinuation)
@@ -2228,7 +2241,7 @@ private fun JingduApp(initialUrl: String = "") {
                             !hasUncachedPageContinuation(cached)
                     }
                     ?.takeUnless { cached -> sameUrl(cached.sourceUrl, currentSourceUrl) }
-                val nextChapter = navigationLinks.next?.href
+                val nextChapter = windowLinks.next?.href
                     ?.let(::normalizeUrl)
                     ?.let(::findCached)
                     ?.let(::mergeCachedContinuation)
@@ -3612,7 +3625,8 @@ private fun Modifier.horizontalPageGestureDetector(
     currentPage: () -> Int,
     onUserGesture: () -> Unit,
     onTap: (tappedLeft: Boolean) -> Unit,
-    onSwipe: (swipedRight: Boolean, pageAtDown: Int, passedSnapThreshold: Boolean) -> Unit
+    onSwipe: (swipedRight: Boolean, pageAtDown: Int, passedSnapThreshold: Boolean) -> Unit,
+    onTrace: (String) -> Unit = {}
 ): Modifier = pointerInput(key) {
     awaitEachGesture {
         val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Final)
@@ -3650,7 +3664,10 @@ private fun Modifier.horizontalPageGestureDetector(
                     onUserGesture()
                     onTap(false)
                 }
+                else -> onTrace("tap_center x=${start.x.toInt()} page=$pageAtDown")
             }
+        } else if (moved) {
+            onTrace("tap_ignored_slop x=${start.x.toInt()} page=$pageAtDown")
         }
     }
 }
@@ -3781,6 +3798,8 @@ private fun ChapterView(
             chapterOpenPosition = chapterOpenPosition,
             nextChapter = nextChapter,
             nextChapterReady = nextChapterReady,
+            previousChapter = previousChapter,
+            previousChapterReady = previousChapter != null,
             navigationLinks = navigationLinks,
             onPositionChange = onPositionChange,
             onNavigateChapter = onNavigateChapter,
@@ -4095,6 +4114,8 @@ private fun HorizontalChapterView(
     chapterOpenPosition: ChapterOpenPosition?,
     nextChapter: ReaderDocument?,
     nextChapterReady: Boolean,
+    previousChapter: ReaderDocument?,
+    previousChapterReady: Boolean,
     navigationLinks: ReaderNavigationLinks,
     onPositionChange: (ReadingPositionSnapshot, Boolean) -> Unit,
     onNavigateChapter: (String, ChapterOpenPosition) -> Unit,
@@ -4167,8 +4188,51 @@ private fun HorizontalChapterView(
                 }
                 .orEmpty()
         }
-        val showNextContent = hasNextChapter && nextPages.isNotEmpty()
-        val totalPages = pages.size + if (showNextContent) nextPages.size else 0
+        val previousPages = remember(
+            previousChapter?.sourceUrl,
+            previousChapter?.paragraphs,
+            settings.fontSize,
+            settings.lineHeight,
+            contentWidthPx,
+            contentHeightPx,
+            headerTextStyles,
+            bodyTextStyle
+        ) {
+            previousChapter
+                ?.takeIf { previousChapterReady && !it.isCatalog && it.paragraphs.isNotEmpty() }
+                ?.let { previous ->
+                    val previousHeaderHeight = horizontalHeaderHeightPx(
+                        previous,
+                        textMeasurer,
+                        density,
+                        contentWidthPx,
+                        headerTextStyles
+                    )
+                    paginateChapterPages(
+                        previous,
+                        textMeasurer,
+                        density,
+                        contentWidthPx,
+                        contentHeightPx,
+                        previousHeaderHeight,
+                        bodyTextStyle
+                    )
+                }
+                .orEmpty()
+        }
+        // One continuous page sequence: the previous chapter's last page, this chapter, then the
+        // next chapter. Chapters are only seams inside the sequence, so the reader never reloads
+        // a chapter just to reach the page next to it.
+        val previousDisplayPages = if (previousPages.isNotEmpty()) listOf(previousPages.last()) else emptyList()
+        val currentStartPageIndex = previousDisplayPages.size
+        val nextStartPageIndex = currentStartPageIndex + pages.size
+        val showNextContent = nextPages.isNotEmpty()
+        val displayPages = buildList {
+            addAll(previousDisplayPages)
+            addAll(pages)
+            addAll(nextPages)
+        }
+        val totalPages = displayPages.size
         val pagerState = key(document.sourceUrl) {
             rememberPagerState(pageCount = { totalPages })
         }
@@ -4186,33 +4250,43 @@ private fun HorizontalChapterView(
         var positionRestored by remember(document.sourceUrl) { mutableStateOf(false) }
         var horizontalUserScrollGeneration by remember(document.sourceUrl) { mutableStateOf(0) }
 
-        LaunchedEffect(document.sourceUrl, chapterOpenPosition, pages.size, settings.fontSize, settings.lineHeight, contentWidthPx, contentHeightPx) {
+        LaunchedEffect(
+            document.sourceUrl,
+            chapterOpenPosition,
+            currentStartPageIndex,
+            nextStartPageIndex,
+            totalPages,
+            settings.fontSize,
+            settings.lineHeight,
+            contentWidthPx,
+            contentHeightPx
+        ) {
             positionRestored = false
             val savedPage = preferences.getInt(horizontalProgressKey, 0)
             val savedOffset = preferences.getInt(offsetKey, -1)
             val anchorOffset = savedOffset.takeIf { it >= 0 } ?: readingOffset
             val target = when (chapterOpenPosition) {
-                ChapterOpenPosition.START -> 0
-                ChapterOpenPosition.END -> pages.lastIndex
+                ChapterOpenPosition.START -> currentStartPageIndex
+                ChapterOpenPosition.END -> (nextStartPageIndex - 1).coerceAtLeast(currentStartPageIndex)
                 null -> if (anchorOffset != null) {
-                    horizontalPageForOffset(pages, anchorOffset)
+                    currentStartPageIndex + horizontalPageForOffset(pages, anchorOffset)
                 } else {
-                    savedPage
+                    currentStartPageIndex + savedPage
                 }
             }
-            pagerState.scrollToPage(target.coerceIn(0, max(0, pages.lastIndex)))
+            pagerState.scrollToPage(target.coerceIn(0, max(0, totalPages - 1)))
             positionRestored = true
         }
-        LaunchedEffect(pagerState, horizontalProgressKey, offsetKey, pages, nextPages, showNextContent) {
-            snapshotFlow { Triple(positionRestored, pagerState.currentPage, pages.size) }
+        LaunchedEffect(pagerState, horizontalProgressKey, offsetKey, currentStartPageIndex, nextStartPageIndex, totalPages) {
+            snapshotFlow { Triple(positionRestored, pagerState.currentPage, totalPages) }
                 .distinctUntilChanged()
                 .collectLatest { (restored, page, _) ->
                     if (!restored) return@collectLatest
-                    val inNextContent = showNextContent && page >= pages.size
-                    val progressDocument = if (inNextContent) nextChapter!! else document
-                    val progressPages = if (inNextContent) nextPages else pages
-                    val contentPage = (if (inNextContent) page - pages.size else page)
-                        .coerceIn(0, progressPages.lastIndex)
+                    val acrossNext = nextStartPageIndex in 0 until totalPages && page >= nextStartPageIndex
+                    val progressDocument = if (acrossNext) nextChapter!! else document
+                    val progressPages = if (acrossNext) nextPages else pages
+                    val displayIndex = if (acrossNext) page - nextStartPageIndex else page - currentStartPageIndex
+                    val contentPage = displayIndex.coerceIn(0, progressPages.lastIndex)
                     val textOffset = progressPages[contentPage].startOffset
                     onPositionChange(
                         ReadingPositionSnapshot(
@@ -4233,9 +4307,8 @@ private fun HorizontalChapterView(
             document.sourceUrl,
             navigationLinks.previous?.href,
             navigationLinks.next?.href,
-            pages.size,
-            nextPages.size,
-            showNextContent
+            totalPages,
+            currentStartPageIndex
         ) {
             var lastHandledUserGesture = horizontalUserScrollGeneration
             snapshotFlow {
@@ -4249,11 +4322,9 @@ private fun HorizontalChapterView(
                 .collectLatest { (gesture, restored) ->
                     val (generation, page, scrolling) = gesture
                     if (!restored || scrolling || generation <= lastHandledUserGesture) return@collectLatest
-                    val enteredNextContent = showNextContent && page >= pages.size
-                    val reachedCurrentEnd = !showNextContent && page >= pages.lastIndex
-                    if (!enteredNextContent && !reachedCurrentEnd) {
-                        return@collectLatest
-                    }
+                    // The page sequence only ends when the attached next chapter is exhausted;
+                    // reaching it hands the window forward so the very next page acts the same way.
+                    if (page < totalPages - 1) return@collectLatest
                     lastHandledUserGesture = generation
                     onAutoNext()
                 }
@@ -4286,63 +4357,65 @@ private fun HorizontalChapterView(
                             } else {
                                 current - 1
                             }
-                            when {
-                                target in 0 until totalPages -> {
-                                    pagerScope.launch { pagerState.animateScrollToPage(target) }
-                                }
-                                tappedLeft && settings.horizontalTapMode == HorizontalTapMode.SIDE_PAGES && current == 0 -> {
-                                    navigationLinks.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.END) }
-                                }
-                                !tappedLeft && current == pages.lastIndex -> {
-                                    Unit
-                                }
+                            if (target in 0 until totalPages) {
+                                pagerScope.launch { pagerState.animateScrollToPage(target) }
                             }
                         },
                         onSwipe = { swipedRight, pageAtDown, passedSnapThreshold ->
                             val target = if (swipedRight) pageAtDown - 1 else pageAtDown + 1
-                            when {
-                                target in 0 until totalPages &&
-                                    passedSnapThreshold && pagerState.currentPage == pageAtDown -> {
-                                    pagerScope.launch {
-                                        if (pagerState.isScrollInProgress) {
-                                            snapshotFlow { pagerState.isScrollInProgress }.first { scrolling -> !scrolling }
-                                        }
-                                        if (pagerState.currentPage == pageAtDown) {
-                                            pagerState.animateScrollToPage(target)
-                                        }
+                            if (target in 0 until totalPages &&
+                                passedSnapThreshold && pagerState.currentPage == pageAtDown
+                            ) {
+                                pagerScope.launch {
+                                    if (pagerState.isScrollInProgress) {
+                                        snapshotFlow { pagerState.isScrollInProgress }.first { scrolling -> !scrolling }
+                                    }
+                                    if (pagerState.currentPage == pageAtDown) {
+                                        pagerState.animateScrollToPage(target)
                                     }
                                 }
-                                swipedRight && pageAtDown == 0 -> {
-                                    navigationLinks.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.END) }
-                                }
-                                !swipedRight && pageAtDown == pages.lastIndex && !showNextContent -> {
-                                    Unit
-                                }
                             }
-                        }
+                        },
+                        onTrace = onLayoutTrace
                     )
             ) { page ->
-                if (showNextContent && page >= pages.size) {
-                    val nextPage = page - pages.size
-                    HorizontalChapterPage(
-                        document = nextChapter!!,
-                        text = nextPages[nextPage].text,
-                        page = nextPage,
-                        headerHeightPx = nextHeaderHeightPx,
-                        headerTextStyles = headerTextStyles,
-                        textStyle = bodyTextStyle,
-                        palette = palette
-                    )
-                } else {
-                    HorizontalChapterPage(
-                        document = document,
-                        text = pages[page].text,
-                        page = page,
-                        headerHeightPx = headerHeightPx,
-                        headerTextStyles = headerTextStyles,
-                        textStyle = bodyTextStyle,
-                        palette = palette
-                    )
+                when {
+                    page < currentStartPageIndex -> {
+                        val previousPage = previousPages.lastIndex
+                        HorizontalChapterPage(
+                            document = previousChapter!!,
+                            text = previousPages[previousPage].text,
+                            page = previousPage,
+                            headerHeightPx = 0,
+                            headerTextStyles = headerTextStyles,
+                            textStyle = bodyTextStyle,
+                            palette = palette
+                        )
+                    }
+                    page >= nextStartPageIndex -> {
+                        val nextPage = page - nextStartPageIndex
+                        HorizontalChapterPage(
+                            document = nextChapter!!,
+                            text = nextPages[nextPage].text,
+                            page = nextPage,
+                            headerHeightPx = nextHeaderHeightPx,
+                            headerTextStyles = headerTextStyles,
+                            textStyle = bodyTextStyle,
+                            palette = palette
+                        )
+                    }
+                    else -> {
+                        val currentPage = page - currentStartPageIndex
+                        HorizontalChapterPage(
+                            document = document,
+                            text = pages[currentPage].text,
+                            page = currentPage,
+                            headerHeightPx = headerHeightPx,
+                            headerTextStyles = headerTextStyles,
+                            textStyle = bodyTextStyle,
+                            palette = palette
+                        )
+                    }
                 }
             }
             }
@@ -4352,13 +4425,20 @@ private fun HorizontalChapterView(
                     .height(HorizontalPageIndicatorHeight),
                 contentAlignment = Alignment.Center
             ) {
-                if (pagerState.currentPage < pages.size) {
-                    Text(
-                        "${pagerState.currentPage + 1} / ${pages.size}",
-                        color = palette.muted,
-                        fontSize = 10.sp
-                    )
+                val displayPage = pagerState.currentPage
+                val indicatorLabel = when {
+                    displayPage < currentStartPageIndex -> "${previousPages.size} / ${previousPages.size}"
+                    displayPage >= nextStartPageIndex -> {
+                        val nextPage = displayPage - nextStartPageIndex
+                        "${nextPage + 1} / ${nextPages.size}"
+                    }
+                    else -> "${displayPage - currentStartPageIndex + 1} / ${pages.size}"
                 }
+                Text(
+                    indicatorLabel,
+                    color = palette.muted,
+                    fontSize = 10.sp
+                )
             }
         }
     }

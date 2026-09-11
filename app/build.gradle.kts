@@ -30,8 +30,8 @@ android {
         applicationId = "com.example.jingdu"
         minSdk = 26
         targetSdk = 35
-        versionCode = 55
-        versionName = "1.3.51"
+        versionCode = 56
+        versionName = "1.3.52"
     }
 
     signingConfigs {
