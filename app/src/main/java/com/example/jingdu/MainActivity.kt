@@ -141,8 +141,6 @@ private enum class AppScreen { HOME, READER, BOOKSHELF }
 private enum class HomeTab { SHELF, SEARCH, SETTINGS }
 
 private const val DefaultSearchSite = "www.weimangguo.com"
-// Debug-only intent extra: drives the directory drawer without taps on a physical device.
-private const val ExtraDebugCatalog = "jingdu_debug_catalog"
 // How many extra catalogue pages one "reached the bottom" batch may pull before asking again.
 private const val CatalogPageBatchSize = 5
 
@@ -503,34 +501,22 @@ private val NightPalette = ReaderPalette(
 
 class MainActivity : ComponentActivity() {
     private val sharedUrlState = mutableStateOf("")
-    // Debug-only: "open" opens the directory without taps, "crawl" also asks for the next batch.
-    private val debugCatalogActionState = mutableStateOf("")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestedOrientation = loadScreenOrientation(getSharedPreferences("jingdu", 0)).toRequestedOrientation()
         sharedUrlState.value = extractSharedUrl(intent)
-        debugCatalogActionState.value =
-            if (BuildConfig.DEBUG) intent?.getStringExtra(ExtraDebugCatalog).orEmpty() else ""
-        setContent {
-            JingduApp(
-                initialUrl = sharedUrlState.value,
-                debugCatalogAction = debugCatalogActionState.value
-            )
-        }
+        setContent { JingduApp(initialUrl = sharedUrlState.value) }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         sharedUrlState.value = extractSharedUrl(intent)
-        if (BuildConfig.DEBUG) {
-            debugCatalogActionState.value = intent?.getStringExtra(ExtraDebugCatalog).orEmpty()
-        }
     }
 }
 
 @Composable
-private fun JingduApp(initialUrl: String = "", debugCatalogAction: String = "") {
+private fun JingduApp(initialUrl: String = "") {
     val context = androidx.compose.ui.platform.LocalContext.current
     val activity = context as? ComponentActivity
     val preferences = remember { context.getSharedPreferences("jingdu", 0) }
@@ -2758,7 +2744,6 @@ private fun JingduApp(initialUrl: String = "", debugCatalogAction: String = "") 
                     catalogIndex = activeCatalogIndex,
                     catalogLoading = catalogLoadUrl.isNotEmpty(),
                     catalogLoadedPageCount = catalogLoadedPageCount,
-                    debugCatalogAction = debugCatalogAction,
                     catalogComplete = catalogComplete,
                     catalogError = catalogErrorMessage,
                     isInBookshelf = currentBookInShelf,
@@ -2849,19 +2834,6 @@ private fun JingduApp(initialUrl: String = "", debugCatalogAction: String = "") 
                          }
                      }
                 )
-                // Debug-only probe used by tools/device-catalog-check.ps1: it drives the directory
-                // flow that otherwise needs taps. It never runs in a release build.
-                LaunchedEffect(debugCatalogAction, document?.sourceUrl) {
-                    if (!BuildConfig.DEBUG || debugCatalogAction.isEmpty()) return@LaunchedEffect
-                    val current = document?.takeUnless { it.isCatalog } ?: return@LaunchedEffect
-                    if (current.paragraphs.isEmpty()) return@LaunchedEffect
-                    prepareCatalogForReading()
-                    if (debugCatalogAction == "crawl") {
-                        // Wait for the first page, then act like a reader who reached the end.
-                        delay(4_000L)
-                        requestMoreCatalogPages()
-                    }
-                }
             }
             availableUpdate?.let { update ->
                 AlertDialog(
@@ -4020,7 +3992,6 @@ private fun ReaderScreen(
     onCloseCatalog: () -> Unit,
     onRetryCatalog: () -> Unit,
     onRequestMoreCatalogPages: () -> Unit,
-    debugCatalogAction: String = "",
     onClose: () -> Unit,
     onReload: () -> Unit,
     onAutoNext: () -> Unit,

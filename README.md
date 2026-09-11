@@ -57,4 +57,15 @@
 
 `tools/device-check.ps1` 和 `tools/device-tap.ps1` 用于真机/模拟器回归：前者用 SEND intent 打开网址并输出应用真实写入的正文、目录和导航状态，后者按屏幕文本点击按钮。
 
+`app/src/androidTest/java/com/example/jingdu/CatalogDrawerTest.kt` 覆盖目录抽屉的两条关键行为：滚到底部请求下一批、追加新页不重置列表、只有重新打开抽屉才定位当前章节。用 `gradlew :app:connectedDebugAndroidTest` 在连接的设备上运行。
+
+`tools/fixture-book-server.js` 提供一个本地测试书站（12 页目录、每页 20 章、正文分两页），当真实站点不可用时可用它回归目录抓取链路：
+
+```powershell
+node tools/fixture-book-server.js 8765                       # 宿主机启动
+adb shell am start -a android.intent.action.SEND -t text/plain `
+  --es android.intent.extra.TEXT "http://10.0.2.2:8765/book/3.html" `
+  -n com.example.jingdu/.MainActivity                        # 模拟器用 10.0.2.2 访问宿主机
+```
+
 应用需要网络权限以加载用户输入的网页；页面正文只在设备本地提取和渲染，不上传到第三方服务。它不绕过登录、付费限制或 DRM。
