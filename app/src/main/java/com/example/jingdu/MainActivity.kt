@@ -146,6 +146,10 @@ private const val CATALOG_STATE_ERROR_KEY = "catalog_state_error"
 private const val DIAGNOSTIC_LOG_KEY = "diagnostic_log"
 private const val MAX_DIAGNOSTIC_LOGS = 150
 
+// How many chapters past the current one stay warm: the reader can be reading one chapter while
+// the next two are already cached, which keeps the boundary transition instant.
+private const val MaxPrefetchChapterDepth = 2
+
 private fun ReaderDocument.isUsableForReading(): Boolean =
     (isCatalog && catalogItems.isNotEmpty()) || (!isCatalog && paragraphs.isNotEmpty())
 
@@ -639,6 +643,7 @@ private fun JingduApp(initialUrl: String = "") {
     var pendingAutoNext by remember { mutableStateOf(false) }
     var prefetchPageBaseUrl by remember { mutableStateOf("") }
     var prefetchChapterDepth by remember { mutableStateOf(0) }
+    var prefetchCompletedKeys by remember { mutableStateOf(emptySet<String>()) }
     var previousPageBaseUrl by remember { mutableStateOf("") }
     var chapterNavigationTarget by remember { mutableStateOf("") }
     var activeRetryUrl by remember { mutableStateOf("") }
@@ -948,28 +953,53 @@ private fun JingduApp(initialUrl: String = "") {
         return link.href.isNotBlank() && !sameUrl(link.href, result.sourceUrl)
     }
 
-    fun prepareNext(result: ReaderDocument) {
-        if (result.isCatalog) {
-            setPrefetchTarget("", "")
-            return
-        }
+    // True while the fetched chapter is still ahead of the chapter being read, so the warm-ahead
+    // chain may continue; chapters behind the reader are cached without extending the chain.
+    fun lineOfChapter(url: String): Int {
+        val items = navigationCatalogFor(document ?: return -1)?.catalogItems.orEmpty()
+        val keys = catalogChapterKeys(url)
+        return items.indexOfFirst { item -> catalogChapterKeys(item.href).any { it in keys } }
+    }
+
+    fun isAheadOfCurrent(baseUrl: String): Boolean {
+        if (prefetchChapterDepth >= MaxPrefetchChapterDepth) return false
+        val current = document?.takeUnless { it.isCatalog } ?: return false
+        if (sameUrl(baseUrl, current.sourceUrl)) return false
+        val baseLine = lineOfChapter(baseUrl)
+        val currentLine = lineOfChapter(current.sourceUrl)
+        if (baseLine < 0 || currentLine < 0) return false
+        return baseLine > currentLine
+    }
+
+    // The next thing that still needs downloading after this chapter: its own remaining text
+    // pages first, then the following chapter. Returns an empty base url when nothing is needed.
+    fun nextPrefetchTarget(result: ReaderDocument): Pair<String, String> {
+        if (result.isCatalog) return "" to ""
         val currentContinuation = uncachedPageContinuationUrl(result)
         if (currentContinuation != null && !sameUrl(currentContinuation, result.sourceUrl)) {
-            setPrefetchTarget(cacheKey(result.sourceUrl), currentContinuation)
-            return
+            return cacheKey(result.sourceUrl) to currentContinuation
         }
         val next = nextChapterLink(result)?.href?.let(::normalizeUrl).orEmpty()
-        val cachedNext = next.takeIf { it.isNotEmpty() }?.let(::findCached)
+        if (next.isEmpty() || sameUrl(next, result.sourceUrl)) return "" to ""
+        val cachedNext = findCached(next)
         val nextContinuation = cachedNext?.let(::uncachedPageContinuationUrl)
         if (nextContinuation != null && !sameUrl(nextContinuation, cachedNext.sourceUrl)) {
-            setPrefetchTarget(cacheKey(cachedNext.sourceUrl), nextContinuation)
-            return
+            return cacheKey(cachedNext.sourceUrl) to nextContinuation
         }
         val nextReady = cachedNext != null && cachedNext.isUsableForReading()
-        setPrefetchTarget(
-            "",
-            if (next.isNotEmpty() && !nextReady && !sameUrl(next, result.sourceUrl)) next else ""
-        )
+        // Guard against downloading the same chapter twice in one session even if the in-memory
+        // cache entry was pruned between the download and this check.
+        if (nextReady || cacheKey(next) in prefetchCompletedKeys) return "" to ""
+        return "" to next
+    }
+
+    fun prepareNext(result: ReaderDocument): Boolean {
+        val (baseUrl, targetUrl) = nextPrefetchTarget(result)
+        val alreadyDownloading = targetUrl.isNotEmpty() &&
+            (sameUrl(prefetchLoadUrl, targetUrl) || sameUrl(prefetchPageBaseUrl, targetUrl))
+        setPrefetchTarget(baseUrl, targetUrl)
+        // A repeat request for the download already in flight must not look like progress.
+        return targetUrl.isNotEmpty() && !alreadyDownloading
     }
 
     fun preparePrevious(result: ReaderDocument) {
@@ -1452,6 +1482,8 @@ private fun JingduApp(initialUrl: String = "") {
         restartPrefetchWebView()
         if (sameUrl(prefetchLoadUrl, expected)) prefetchLoadUrl = ""
         if (sameUrl(previousLoadUrl, expected)) previousLoadUrl = ""
+        cacheKey(expected).takeIf { it.isNotEmpty() }?.let { key -> prefetchCompletedKeys += key }
+        cacheKey(result.sourceUrl).takeIf { it.isNotEmpty() }?.let { key -> prefetchCompletedKeys += key }
 
         val pageBase = prefetchPageBaseUrl
         if (pageBase.isNotEmpty()) {
@@ -1487,14 +1519,18 @@ private fun JingduApp(initialUrl: String = "") {
                     saveCachedReaderDocument(preferences, merged)
                     updateShelfForDocument(merged)
                     pruneCache(merged, previousDocument)
+                    // Attached chapter content grew: restart the warm-ahead budget for this chapter.
+                    prefetchChapterDepth = 0
                     preparePrevious(merged)
                     prepareNext(merged)
                 } else if (uncachedPageContinuationUrl(merged) != null) {
                     prepareNext(merged)
-                } else if (!baseIsCurrent && prefetchChapterDepth == 0) {
-                    // Warm one following chapter so promotion at the next boundary stays continuous.
-                    prefetchChapterDepth = 1
-                    prepareNext(merged)
+                } else if (isAheadOfCurrent(base.sourceUrl)) {
+                    // Keep the following chapters warm while the reader is still behind them.
+                    if (prepareNext(merged)) {
+                        prefetchChapterDepth += 1
+                        recordDiagnostic("warm_ahead", merged.sourceUrl, "depth=$prefetchChapterDepth")
+                    }
                 }
                 return
             }
@@ -1519,10 +1555,13 @@ private fun JingduApp(initialUrl: String = "") {
                 pending.verticalOffset,
                 loadActiveWebView = false
             )
-        } else if (prefetchChapterDepth == 0) {
-            // Warm one following chapter, then stop until the reader promotes it.
-            prefetchChapterDepth = 1
-            prepareNext(result)
+        } else if (isAheadOfCurrent(result.sourceUrl)) {
+            // The fetched chapter sits ahead of the chapter being read, so keep warming forward:
+            // without this the reader has to wait for the chapter after the attached one.
+            if (prepareNext(result)) {
+                prefetchChapterDepth += 1
+                recordDiagnostic("warm_ahead", result.sourceUrl, "depth=$prefetchChapterDepth")
+            }
         }
     }
 
