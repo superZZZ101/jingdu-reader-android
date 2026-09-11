@@ -422,11 +422,12 @@ private fun JingduApp(initialUrl: String = "") {
         if (initialUrl.isNotBlank()) address = initialUrl
     }
     var document by remember { mutableStateOf(restoredDocument) }
-    DisposableEffect(activity, document) {
+    var visibleDocumentForPersistence by remember { mutableStateOf(restoredDocument) }
+    DisposableEffect(activity, document, visibleDocumentForPersistence) {
         val lifecycle = activity?.lifecycle
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_STOP) {
-                document?.let {
+                (visibleDocumentForPersistence ?: document)?.let {
                     saveCachedReaderDocument(preferences, it, commit = true)
                 }
                 saveLatestReadingPosition(commit = true)
@@ -557,6 +558,7 @@ private fun JingduApp(initialUrl: String = "") {
     ) { mutableStateOf<PendingChapterNavigation?>(null) }
     var pendingAutoNext by remember { mutableStateOf(false) }
     var prefetchPageBaseUrl by remember { mutableStateOf("") }
+    var prefetchChapterDepth by remember { mutableStateOf(0) }
     var previousPageBaseUrl by remember { mutableStateOf("") }
     var chapterNavigationTarget by remember { mutableStateOf("") }
     var activeRetryUrl by remember { mutableStateOf("") }
@@ -665,6 +667,7 @@ private fun JingduApp(initialUrl: String = "") {
         activeRetryScheduled = false
         prefetchLoadUrl = ""
         prefetchPageBaseUrl = ""
+        prefetchChapterDepth = 0
         prefetchRetryUrl = ""
         prefetchRetryCount = 0
         prefetchRetryScheduled = false
@@ -767,6 +770,23 @@ private fun JingduApp(initialUrl: String = "") {
         current?.navigation?.next?.href?.let { keep += cacheKey(it) }
         current?.navigation?.previousPage?.href?.let { keep += cacheKey(it) }
         current?.navigation?.nextPage?.href?.let { keep += cacheKey(it) }
+        listOf(prefetchPageBaseUrl, prefetchLoadUrl).forEach { url ->
+            cacheKey(url).takeIf { it.isNotEmpty() }?.let { keep += it }
+        }
+        fun keepPageChain(startUrl: String) {
+            var cached = findCached(startUrl)
+            val visited = mutableSetOf<String>()
+            while (cached != null && visited.add(cacheKey(cached.sourceUrl))) {
+                keep += cacheKey(cached.sourceUrl)
+                val nextPage = cached.navigation.nextPage?.href?.let(::normalizeUrl).orEmpty()
+                if (nextPage.isEmpty()) break
+                keep += cacheKey(nextPage)
+                cached = findCached(nextPage)
+            }
+        }
+        keepPageChain(current?.sourceUrl.orEmpty())
+        keepPageChain(previous?.sourceUrl.orEmpty())
+        keepPageChain(current?.navigation?.next?.href.orEmpty())
         val keptSources = cachedDocuments.values
             .distinctBy { cacheKey(it.sourceUrl) }
             .filter { cacheKey(it.sourceUrl) in keep }
@@ -993,7 +1013,9 @@ private fun JingduApp(initialUrl: String = "") {
     }
 
     fun saveCurrentDocumentCache(commit: Boolean = false) {
-        document?.let { saveCachedReaderDocument(preferences, it, commit = commit) }
+        (visibleDocumentForPersistence ?: document)?.let {
+            saveCachedReaderDocument(preferences, it, commit = commit)
+        }
     }
 
     fun savedReadingOffset(url: String): Int? = preferences
@@ -1043,6 +1065,7 @@ private fun JingduApp(initialUrl: String = "") {
         }
         cacheDocument(displayResult, requestedUrl)
         document = displayResult
+        visibleDocumentForPersistence = displayResult
         saveCachedReaderDocument(preferences, displayResult)
         if (displayResult.isCatalog) saveCachedCatalogDocument(preferences, displayResult)
         updateShelfForDocument(displayResult)
@@ -1070,6 +1093,7 @@ private fun JingduApp(initialUrl: String = "") {
         }
         pruneCache(displayResult, previousDocument)
         restartPrefetchWebView()
+        prefetchChapterDepth = 0
         preparePrevious(displayResult)
         prepareNext(displayResult)
         if (displayResult.isCatalog) startCatalogCrawl(displayResult.sourceUrl, displayResult)
@@ -1202,6 +1226,7 @@ private fun JingduApp(initialUrl: String = "") {
             restartPrefetchWebView()
             prefetchLoadUrl = ""
             prefetchPageBaseUrl = ""
+            prefetchChapterDepth = 0
             previousLoadUrl = ""
         }
     }
@@ -1228,6 +1253,11 @@ private fun JingduApp(initialUrl: String = "") {
 
     fun requestAutoNext() {
         val current = document ?: return
+        if (settings.pageMode == PageMode.VERTICAL) {
+            // Keep the current list alive while the next chapter is fetched and appended.
+            prepareNext(current)
+            return
+        }
         val nextUrl = current.navigation.next?.href?.let(::normalizeUrl).orEmpty()
         if (nextUrl.isEmpty() || sameUrl(nextUrl, current.sourceUrl)) {
             pendingAutoNext = hasUncachedPageContinuation(current)
@@ -1258,6 +1288,11 @@ private fun JingduApp(initialUrl: String = "") {
 
     fun failPendingAutoNext(target: String, reason: String) {
         if (!pendingAutoNext) return
+        if (settings.pageMode == PageMode.VERTICAL) {
+            pendingAutoNext = false
+            recordDiagnostic("auto_next_prefetch_failed_vertical", target, reason)
+            return
+        }
         val current = document
         val nextUrl = current?.navigation?.next?.href?.let(::normalizeUrl).orEmpty()
         pendingAutoNext = false
@@ -1280,6 +1315,7 @@ private fun JingduApp(initialUrl: String = "") {
         if (pageBase.isNotEmpty()) {
             val base = findCached(pageBase) ?: document?.takeIf { sameUrl(it.sourceUrl, pageBase) }
             if (base != null && !base.isCatalog && result.sourceUrl.isNotBlank()) {
+                val baseIsCurrent = document?.sourceUrl?.let { sameUrl(it, base.sourceUrl) } == true
                 val merged = mergeCachedContinuation(mergePagedDocuments(base, result))
                 prefetchPageBaseUrl = ""
                 cacheDocument(merged, base.sourceUrl)
@@ -1299,6 +1335,7 @@ private fun JingduApp(initialUrl: String = "") {
                     )
                 } else if (document?.sourceUrl?.let { sameUrl(it, base.sourceUrl) } == true) {
                     document = merged
+                    visibleDocumentForPersistence = merged
                     currentUrl = merged.sourceUrl
                     address = merged.sourceUrl
                     saveCachedReaderDocument(preferences, merged)
@@ -1307,6 +1344,10 @@ private fun JingduApp(initialUrl: String = "") {
                     preparePrevious(merged)
                     prepareNext(merged)
                 } else if (uncachedPageContinuationUrl(merged) != null) {
+                    prepareNext(merged)
+                } else if (!baseIsCurrent && prefetchChapterDepth == 0) {
+                    // Warm one following chapter so promotion at the next boundary stays continuous.
+                    prefetchChapterDepth = 1
                     prepareNext(merged)
                 }
                 return
@@ -1332,6 +1373,10 @@ private fun JingduApp(initialUrl: String = "") {
                 pending.verticalOffset,
                 loadActiveWebView = false
             )
+        } else if (prefetchChapterDepth == 0) {
+            // Warm one following chapter, then stop until the reader promotes it.
+            prefetchChapterDepth = 1
+            prepareNext(result)
         }
     }
 
@@ -1486,6 +1531,7 @@ private fun JingduApp(initialUrl: String = "") {
                 } else if (!prefetchRetryScheduled) {
                     prefetchLoadUrl = ""
                     prefetchPageBaseUrl = ""
+                    prefetchChapterDepth = 0
                     prefetchRetryUrl = ""
                     prefetchRetryCount = 0
                     fallbackPendingChapterToActive(failedUrl)
@@ -1622,6 +1668,7 @@ private fun JingduApp(initialUrl: String = "") {
     }
     LaunchedEffect(
         pendingAutoNext,
+        settings.pageMode,
         document?.sourceUrl,
         document?.paragraphs?.size,
         document?.navigation?.next?.href,
@@ -1631,6 +1678,12 @@ private fun JingduApp(initialUrl: String = "") {
     ) {
         if (!pendingAutoNext) return@LaunchedEffect
         val current = document ?: return@LaunchedEffect
+        if (settings.pageMode == PageMode.VERTICAL) {
+            // Vertical mode consumes the prefetched chapter as list content; do not reset to START.
+            prepareNext(current)
+            pendingAutoNext = false
+            return@LaunchedEffect
+        }
         if (hasUncachedPageContinuation(current)) return@LaunchedEffect
         val nextUrl = current.navigation.next?.href?.let(::normalizeUrl).orEmpty()
         if (nextUrl.isEmpty() || sameUrl(nextUrl, current.sourceUrl)) {
@@ -1715,6 +1768,7 @@ private fun JingduApp(initialUrl: String = "") {
         )
         prefetchLoadUrl = ""
         prefetchPageBaseUrl = ""
+        prefetchChapterDepth = 0
         prefetchRetryUrl = ""
         prefetchRetryCount = 0
         prefetchRetryScheduled = false
@@ -1936,13 +1990,13 @@ private fun JingduApp(initialUrl: String = "") {
                     ?.takeIf { cached ->
                         cached.isUsableForReading() &&
                             !cached.isCatalog &&
-                            !hasUncachedPageContinuation(cached)
+                            (settings.pageMode == PageMode.VERTICAL || !hasUncachedPageContinuation(cached))
                     }
                     ?.takeUnless { cached ->
                         sameUrl(cached.sourceUrl, currentSourceUrl) ||
                             (previousChapter != null && sameUrl(cached.sourceUrl, previousChapter.sourceUrl))
                     }
-                val nextChapterReady = nextChapter != null
+                val nextChapterReady = nextChapter != null && !hasUncachedPageContinuation(nextChapter)
                 val currentBookInShelf = document?.takeUnless { it.isCatalog }?.let { current ->
                     shelfBooks.any { book -> book.key == shelfKeyForDocument(current) }
                 } == true
@@ -2003,6 +2057,16 @@ private fun JingduApp(initialUrl: String = "") {
                          if (persist && document?.sourceUrl?.let { current -> sameUrl(current, position.sourceUrl) } == true) {
                              readingOffset = position.textOffset
                          }
+                         if (persist) {
+                             val persistedDocument = findCached(position.sourceUrl)
+                                 ?.takeUnless { it.isCatalog }
+                                 ?: document?.takeIf { sameUrl(it.sourceUrl, position.sourceUrl) }
+                             if (persistedDocument != null) {
+                                 visibleDocumentForPersistence = persistedDocument
+                                 preferences.edit().putString("last_url", persistedDocument.sourceUrl).apply()
+                                 saveCachedReaderDocument(preferences, persistedDocument)
+                             }
+                         }
                          if (persist && catalogPositionChanged && activeCatalogUrl.isNotEmpty()) {
                               findCached(activeCatalogUrl)?.catalogItems?.indexOfFirst { item ->
                                   catalogItemMatches(item, position.sourceUrl, position.chapterTitle)
@@ -2013,18 +2077,10 @@ private fun JingduApp(initialUrl: String = "") {
                           if (persist) saveLatestReadingPosition()
                      },
                     onNavigate = { openUrl(it) },
-                    onNavigateChapter = { href, position ->
-                         val current = document
-                         val nextHref = current?.navigation?.next?.href
-                         if (position == ChapterOpenPosition.START && current != null &&
-                             nextHref != null && sameUrl(href, nextHref)
-                         ) {
-                             requestAutoNext()
-                         } else {
-                             openChapter(href, position)
-                         }
+                     onNavigateChapter = { href, position ->
+                         openChapter(href, position)
                      },
-                                         onContinueToChapter = { href, index, offset ->
+                     onContinueToChapter = { href, index, offset ->
                         openChapter(href, verticalIndex = index, verticalOffset = offset)
                     },
                     onNavigateFromCatalog = { href, catalogUrl, index ->
@@ -2040,7 +2096,7 @@ private fun JingduApp(initialUrl: String = "") {
                         if (catalogUrl.isNotEmpty()) startCatalogCrawl(catalogUrl, forceReload = true)
                     },
                     onClose = {
-                        document?.let { current ->
+                        (visibleDocumentForPersistence ?: document)?.let { current ->
                             saveCachedReaderDocument(preferences, current, commit = true)
                         }
                         saveLatestReadingPosition(commit = true)
@@ -2049,7 +2105,15 @@ private fun JingduApp(initialUrl: String = "") {
                         loading = false
                     },
                     onReload = { openUrl(currentUrl, forceReload = true) },
-                     onAutoNext = { requestAutoNext() }
+                     onAutoNext = { requestAutoNext() },
+                     onOpenNextChapter = {
+                         val next = document?.navigation?.next
+                         if (next != null && !sameUrl(next.href, document?.sourceUrl.orEmpty())) {
+                             openChapter(next.href, ChapterOpenPosition.START)
+                         } else {
+                             requestAutoNext()
+                         }
+                     }
                 )
             }
             availableUpdate?.let { update ->
@@ -2584,7 +2648,8 @@ private fun ReaderScreen(
     onRetryCatalog: () -> Unit,
     onClose: () -> Unit,
     onReload: () -> Unit,
-    onAutoNext: () -> Unit
+    onAutoNext: () -> Unit,
+    onOpenNextChapter: () -> Unit
 ) {
     val palette = paletteFor(settings.theme)
     var menuVisible by rememberSaveable { mutableStateOf(false) }
@@ -2648,14 +2713,7 @@ private fun ReaderScreen(
                     onPositionChange = onPositionChange,
                     onContinueToChapter = onContinueToChapter,
                     onNavigateChapter = onNavigateChapter,
-                    onAutoNext = {
-                        if (document.navigation.next == null) onAutoNext()
-                         document.navigation.next?.let { next ->
-                            if (!sameUrl(next.href, document.sourceUrl)) {
-                                onNavigateChapter(next.href, ChapterOpenPosition.START)
-                            }
-                        }
-                    }
+                    onAutoNext = onAutoNext
                 )
             }
             if (menuVisible) {
@@ -2676,7 +2734,7 @@ private fun ReaderScreen(
                     },
                     onNextChapter = {
                         menuVisible = false
-                        onAutoNext()
+                        onOpenNextChapter()
                     },
                     onOpenCatalog = {
                         onOpenCatalog()
@@ -3397,6 +3455,7 @@ private fun ChapterView(
             verticalOpenOffset = verticalOpenOffset,
             previousChapter = previousChapter,
             nextChapter = nextChapter,
+            nextChapterReady = nextChapterReady,
             onPositionChange = onPositionChange,
             onContinueToChapter = onContinueToChapter,
             onNavigateChapter = onNavigateChapter,
@@ -3416,6 +3475,7 @@ private fun VerticalChapterView(
     verticalOpenOffset: Int?,
     previousChapter: ReaderDocument?,
     nextChapter: ReaderDocument?,
+    nextChapterReady: Boolean,
     onPositionChange: (ReadingPositionSnapshot, Boolean) -> Unit,
     onContinueToChapter: (String, Int, Int) -> Unit,
     onNavigateChapter: (String, ChapterOpenPosition) -> Unit,
@@ -3613,23 +3673,23 @@ private fun VerticalChapterView(
                 if (scrollGeneration <= lastHandledUserScrollGeneration) return@collectLatest
                 lastHandledUserScrollGeneration = scrollGeneration
                 if (!viewport.canScrollForward) {
-                    if (nextChapter == null) {
-                        if (viewport.lastVisible >= currentEndIndex) {
-                            onAutoNext()
-                            return@collectLatest
-                        }
-                    } else {
-                        document.navigation.next?.let {
-                            val nextIndex = if (firstVisible >= nextStartIndex) {
-                                (firstVisible - nextStartIndex).coerceIn(0, nextChapter.paragraphs.size)
-                            } else {
-                                0
+                    when {
+                        nextChapter == null || !nextChapterReady -> {
+                            if (viewport.lastVisible >= currentEndIndex) {
+                                // The next chapter or its remaining page chain is still loading.
+                                onAutoNext()
                             }
-                            val nextOffset = if (firstVisible >= nextStartIndex) viewport.firstOffset else 0
-                            onContinueToChapter(it.href, nextIndex, nextOffset)
                         }
-                        return@collectLatest
+                        firstVisible >= nextStartIndex -> {
+                            // Promote the attached chapter at its visible position so the list does not jump.
+                            onContinueToChapter(
+                                nextChapter.sourceUrl,
+                                (firstVisible - nextStartIndex).coerceIn(0, nextChapter.paragraphs.size),
+                                viewport.firstOffset
+                            )
+                        }
                     }
+                    return@collectLatest
                 }
                 if (!viewport.canScrollBackward && previousChapter != null) {
                     document.navigation.previous?.let {
@@ -3657,7 +3717,7 @@ private fun VerticalChapterView(
                 onSwipeBackward = {
                     if (previousChapter == null) document.navigation.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.END) }
                 },
-                onSwipeForward = { if (nextChapter == null) onAutoNext() }
+                onSwipeForward = { if (nextChapter == null || !nextChapterReady) onAutoNext() }
             ),
         contentPadding = PaddingValues(start = 22.dp, top = 68.dp, end = 22.dp, bottom = 48.dp),
         verticalArrangement = Arrangement.spacedBy(17.dp)
