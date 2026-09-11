@@ -560,8 +560,15 @@ private fun JingduApp(initialUrl: String = "") {
         }
     }
 
+    // A shared link must actually open, not just fill the address bar. The first plain assignment
+    // only mirrors it into the field; the request itself is consumed further down, once the loader
+    // exists, through this one-shot holder.
+    var pendingSharedUrl by remember { mutableStateOf(initialUrl) }
     LaunchedEffect(initialUrl) {
-        if (initialUrl.isNotBlank()) address = initialUrl
+        if (initialUrl.isNotBlank()) {
+            address = initialUrl
+            pendingSharedUrl = initialUrl
+        }
     }
     var document by remember { mutableStateOf(restoredDocument) }
     var visibleDocumentForPersistence by remember { mutableStateOf(restoredDocument) }
@@ -1766,6 +1773,22 @@ private fun JingduApp(initialUrl: String = "") {
             prefetchChapterDepth = 0
             previousLoadUrl = ""
         }
+    }
+
+    // Consume a link the app was launched with: previously a shared URL only filled the address
+    // field, so the reader kept showing whatever book had been restored.
+    LaunchedEffect(pendingSharedUrl, document?.sourceUrl, loading) {
+        val shared = pendingSharedUrl
+        if (shared.isBlank()) return@LaunchedEffect
+        if (loading && document == null) return@LaunchedEffect
+        if (document != null && sameUrl(document?.sourceUrl.orEmpty(), shared)) {
+            pendingSharedUrl = ""
+            return@LaunchedEffect
+        }
+        if (loading) return@LaunchedEffect
+        pendingSharedUrl = ""
+        recordDiagnostic("open_shared_url", shared, "from_intent")
+        openUrl(shared)
     }
 
     fun openChapter(
