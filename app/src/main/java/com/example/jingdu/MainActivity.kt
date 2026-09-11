@@ -155,6 +155,29 @@ private data class ReaderNavigationLinks(
     val catalog: ReaderLink? = null
 )
 
+// Catalog entries are stored as normalized URLs (".../35350916") while the live chapter URL
+// carries a file extension and a text-continuation suffix (".../35350916_2.html"); match them all.
+private fun catalogChapterKeys(raw: String): Set<String> {
+    val value = raw.trim()
+    if (value.isEmpty()) return emptySet()
+    val keys = linkedSetOf<String>()
+    fun add(candidate: String) {
+        val key = cacheKey(candidate)
+        if (key.isNotEmpty()) keys += key
+    }
+    add(value)
+    val withoutExtension = value.replace(Regex("\\.html?$", RegexOption.IGNORE_CASE), "")
+    add(withoutExtension)
+    add(withoutExtension.replace(Regex("_\\d+$"), ""))
+    return keys
+}
+
+private fun isCatalogPageEntry(link: ReaderLink, catalog: ReaderDocument?): Boolean {
+    if (link.href.isBlank()) return false
+    val keys = catalogChapterKeys(link.href)
+    return catalog?.catalogPages.orEmpty().any { page -> catalogChapterKeys(page.href).any { it in keys } }
+}
+
 // Some sites hide the next chapter behind the book catalog (the chapter page itself only links
 // to its own continuation pages), so neighbour links resolve from the loaded catalog first.
 private fun adjacentChapterFromCatalog(
@@ -164,11 +187,14 @@ private fun adjacentChapterFromCatalog(
 ): ReaderLink? {
     val items = catalog?.catalogItems.orEmpty()
     if (items.isEmpty() || document.isCatalog) return null
-    val keys = listOf(document.sourceUrl).filter { it.isNotBlank() } +
-        listOfNotNull(document.navigation.catalog?.href)
-    val index = items.indexOfFirst { item -> keys.any { sameUrl(item.href, it) } }
+    val keys = catalogChapterKeys(document.sourceUrl).toMutableSet()
+    document.navigation.catalog?.href?.let { keys += catalogChapterKeys(it) }
+    val index = items.indexOfFirst { item -> catalogChapterKeys(item.href).any { it in keys } }
     if (index < 0) return null
-    return items.getOrNull(index + step)
+    val candidate = items.getOrNull(index + step) ?: return null
+    // The book page itself is often listed as the first directory entry; it is not a chapter.
+    if (isCatalogPageEntry(candidate, catalog)) return null
+    return candidate
 }
 
 private fun resolveReaderNavigationLinks(
@@ -193,6 +219,7 @@ private fun resolveReaderNavigationLinks(
     val previous = adjacentChapterFromCatalog(document, catalog, -1)
         ?.takeUnless { sameUrl(it.href, document.sourceUrl) }
         ?: document.navigation.previous
+        ?.takeIf { !isCatalogPageEntry(it, catalog) }
     return ReaderNavigationLinks(
         previous = previous,
         next = next,
@@ -601,6 +628,7 @@ private fun JingduApp(initialUrl: String = "") {
     }
     var activeCatalogIndex by remember { mutableStateOf<Int?>(null) }
     var catalogNavigationRevision by remember { mutableStateOf(0) }
+    var persistedCatalogDocument by remember { mutableStateOf(restoredCatalogDocument) }
     var chapterOpenPosition by remember { mutableStateOf<ChapterOpenPosition?>(null) }
     var verticalOpenIndex by remember { mutableStateOf<Int?>(null) }
     var verticalOpenOffset by remember { mutableStateOf<Int?>(null) }
@@ -892,7 +920,16 @@ private fun JingduApp(initialUrl: String = "") {
         val catalogUrl = activeCatalogUrl.takeIf { it.isNotEmpty() }
             ?: result.navigation.catalog?.href?.let(::normalizeUrl).orEmpty()
         if (catalogUrl.isEmpty()) return null
-        return findCached(catalogUrl)?.takeIf { it.isCatalog }
+        val cached = findCached(catalogUrl)?.takeIf { it.isCatalog }
+        // The pruned in-memory cache can drop catalog pages that were loaded earlier; the saved
+        // aggregate catalog still holds the full chapter list, so merge it back for navigation.
+        val persisted = persistedCatalogDocument
+            ?.takeIf { it.isCatalog && sameUrl(it.sourceUrl, catalogUrl) }
+        return when {
+            cached != null && persisted != null -> mergeCatalogDocuments(persisted, cached)
+            cached != null -> cached
+            else -> persisted
+        }
     }
 
     // Chapter pages often expose only a "next page" link, with the real next chapter living on
@@ -947,6 +984,14 @@ private fun JingduApp(initialUrl: String = "") {
 
     LaunchedEffect(document?.sourceUrl, document?.isCatalog, catalogNavigationRevision) {
         document?.takeUnless { it.isCatalog }?.let { restored ->
+            val resolved = resolveReaderNavigationLinks(restored, navigationCatalogFor(restored))
+            if (catalogNavigationRevision > 0) {
+                recordDiagnostic(
+                    "neighbors",
+                    restored.sourceUrl,
+                    "previous=${resolved.previous?.href.orEmpty()} next=${resolved.next?.href.orEmpty()} catalog=${resolved.catalog?.href.orEmpty()}"
+                )
+            }
             preparePrevious(restored)
             prepareNext(restored)
         }
@@ -1052,6 +1097,7 @@ private fun JingduApp(initialUrl: String = "") {
         val merged = if (existing != null) mergeCatalogDocuments(existing, result) else result
         cacheDocument(merged, rootUrl)
         saveCachedCatalogDocument(preferences, merged)
+        persistedCatalogDocument = merged
         pruneCache(merged, previousDocument)
 
         val loadedBefore = catalogLoadedUrls
