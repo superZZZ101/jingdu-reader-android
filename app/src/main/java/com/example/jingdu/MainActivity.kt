@@ -2225,6 +2225,7 @@ private fun JingduApp(initialUrl: String = "") {
                     nextChapterReady = nextChapterReady,
                     navigationLinks = navigationLinks,
                     previousChapterAvailable = previousChapterAvailable,
+                    onLayoutTrace = { details -> recordDiagnostic("layout", "", details) },
                     catalogDocument = cachedCatalog,
                     catalogIndex = activeCatalogIndex,
                     catalogLoading = catalogLoadUrl.isNotEmpty(),
@@ -2909,6 +2910,7 @@ private fun ReaderScreen(
     nextChapterReady: Boolean,
     navigationLinks: ReaderNavigationLinks,
     previousChapterAvailable: Boolean,
+    onLayoutTrace: (String) -> Unit,
     catalogDocument: ReaderDocument?,
     catalogIndex: Int?,
     catalogLoading: Boolean,
@@ -2993,7 +2995,8 @@ private fun ReaderScreen(
                     onPositionChange = onPositionChange,
                     onContinueToChapter = onContinueToChapter,
                     onNavigateChapter = onNavigateChapter,
-                    onAutoNext = onAutoNext
+                    onAutoNext = onAutoNext,
+                    onLayoutTrace = onLayoutTrace
                 )
             }
             if (menuVisible) {
@@ -3723,7 +3726,8 @@ private fun ChapterView(
     onPositionChange: (ReadingPositionSnapshot, Boolean) -> Unit,
     onContinueToChapter: (String, Int, Int) -> Unit,
     onNavigateChapter: (String, ChapterOpenPosition) -> Unit,
-    onAutoNext: () -> Unit
+    onAutoNext: () -> Unit,
+    onLayoutTrace: (String) -> Unit
 ) {
     if (settings.pageMode == PageMode.HORIZONTAL) {
         HorizontalChapterView(
@@ -3734,9 +3738,11 @@ private fun ChapterView(
             chapterOpenPosition = chapterOpenPosition,
             nextChapter = nextChapter,
             nextChapterReady = nextChapterReady,
+            navigationLinks = navigationLinks,
             onPositionChange = onPositionChange,
             onNavigateChapter = onNavigateChapter,
-            onAutoNext = onAutoNext
+            onAutoNext = onAutoNext,
+            onLayoutTrace = onLayoutTrace
         )
     } else {
         VerticalChapterView(
@@ -4002,8 +4008,8 @@ private fun VerticalChapterView(
             .verticalBoundaryGestureDetector(
                 key = listOf(
                      document.sourceUrl,
-                     document.navigation.previous?.href,
-                     document.navigation.next?.href,
+                     navigationLinks.previous?.href,
+                     navigationLinks.next?.href,
                      previousChapter?.sourceUrl,
                      nextChapter?.sourceUrl
                  ),
@@ -4046,9 +4052,11 @@ private fun HorizontalChapterView(
     chapterOpenPosition: ChapterOpenPosition?,
     nextChapter: ReaderDocument?,
     nextChapterReady: Boolean,
+    navigationLinks: ReaderNavigationLinks,
     onPositionChange: (ReadingPositionSnapshot, Boolean) -> Unit,
     onNavigateChapter: (String, ChapterOpenPosition) -> Unit,
-    onAutoNext: () -> Unit
+    onAutoNext: () -> Unit,
+    onLayoutTrace: (String) -> Unit
 ) {
     BoxWithConstraints(
         modifier = Modifier
@@ -4098,7 +4106,7 @@ private fun HorizontalChapterView(
         ) {
             paginateChapterPages(document, textMeasurer, density, contentWidthPx, contentHeightPx, headerHeightPx, bodyTextStyle)
         }
-        val hasNextChapter = document.navigation.next != null
+        val hasNextChapter = navigationLinks.next != null
         val nextPages = remember(
             nextChapter?.sourceUrl,
             nextChapter?.paragraphs,
@@ -4120,6 +4128,12 @@ private fun HorizontalChapterView(
         val totalPages = pages.size + if (showNextContent) nextPages.size else 0
         val pagerState = key(document.sourceUrl) {
             rememberPagerState(pageCount = { totalPages })
+        }
+        LaunchedEffect(document.sourceUrl, totalPages, hasNextChapter, nextChapterReady, navigationLinks.next?.href) {
+            onLayoutTrace(
+                "horizontal_layout url=${document.sourceUrl} hasNext=$hasNextChapter nextReady=$nextChapterReady " +
+                    "next=${navigationLinks.next?.href.orEmpty()} pages=${pages.size} nextPages=${nextPages.size} total=$totalPages"
+            )
         }
         val pagerScope = androidx.compose.runtime.rememberCoroutineScope()
         val context = androidx.compose.ui.platform.LocalContext.current
@@ -4174,8 +4188,8 @@ private fun HorizontalChapterView(
         LaunchedEffect(
             pagerState,
             document.sourceUrl,
-            document.navigation.previous?.href,
-            document.navigation.next?.href,
+            navigationLinks.previous?.href,
+            navigationLinks.next?.href,
             pages.size,
             nextPages.size,
             showNextContent
@@ -4217,8 +4231,8 @@ private fun HorizontalChapterView(
                              document.sourceUrl,
                              totalPages,
                              settings.horizontalTapMode,
-                             document.navigation.previous?.href,
-                             document.navigation.next?.href
+                             navigationLinks.previous?.href,
+                             navigationLinks.next?.href
                          ),
                         currentPage = { pagerState.currentPage },
                         onUserGesture = { horizontalUserScrollGeneration += 1 },
@@ -4234,7 +4248,7 @@ private fun HorizontalChapterView(
                                     pagerScope.launch { pagerState.animateScrollToPage(target) }
                                 }
                                 tappedLeft && settings.horizontalTapMode == HorizontalTapMode.SIDE_PAGES && current == 0 -> {
-                                    document.navigation.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.END) }
+                                    navigationLinks.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.END) }
                                 }
                                 !tappedLeft && current == pages.lastIndex -> {
                                     Unit
@@ -4256,7 +4270,7 @@ private fun HorizontalChapterView(
                                     }
                                 }
                                 swipedRight && pageAtDown == 0 -> {
-                                    document.navigation.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.END) }
+                                    navigationLinks.previous?.let { onNavigateChapter(it.href, ChapterOpenPosition.END) }
                                 }
                                 !swipedRight && pageAtDown == pages.lastIndex && !showNextContent -> {
                                     Unit
