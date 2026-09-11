@@ -26,17 +26,18 @@ private const val UPDATE_REPOSITORY_NAME = "jingdu-reader-android"
 private const val UPDATE_ASSET_NAME = "app-release.apk"
 
 // api.github.com is unreachable from some networks (notably mainland China mobile networks), which
-// made the update check fail silently. These mirrors serve the same release JSON / assets.
+// made the update check fail silently. These mirrors serve the same release JSON / assets;
+// gh-proxy.com answered for both the API and the APK when the others did not.
 private val RELEASE_ENDPOINTS = listOf(
     "https://api.github.com/repos/%s/%s/releases/latest",
-    "https://api.kkgithub.com/repos/%s/%s/releases/latest",
     "https://gh-proxy.com/https://api.github.com/repos/%s/%s/releases/latest",
-    "https://ghfast.top/https://api.github.com/repos/%s/%s/releases/latest"
+    "https://ghfast.top/https://api.github.com/repos/%s/%s/releases/latest",
+    "https://api.kkgithub.com/repos/%s/%s/releases/latest"
 )
 
 private val DOWNLOAD_MIRROR_PREFIXES = listOf(
-    "https://ghproxy.net/",
     "https://gh-proxy.com/",
+    "https://ghproxy.net/",
     "https://ghfast.top/"
 )
 

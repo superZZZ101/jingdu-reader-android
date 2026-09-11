@@ -30,8 +30,8 @@ android {
         applicationId = "com.example.jingdu"
         minSdk = 26
         targetSdk = 35
-        versionCode = 63
-        versionName = "1.3.59"
+        versionCode = 64
+        versionName = "1.3.60"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
